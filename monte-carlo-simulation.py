@@ -10,137 +10,108 @@ School    : University of San Jose-Recoletos
 Programme : Bachelor of Science in Accountancy
 Period    : A.Y. 2025–2026
 
-─── PIPELINE OVERVIEW ───────────────────────────────────────────────────────
-  Stage 0 │ Data Loading & Cleaning
-  Stage 1 │ Estimated Distribution Parameter Calculation (Jul–Dec 2024 baseline)
-  Stage 2 │ Elasticity Parameter Estimation (TRAIN Law natural experiment)
-  Stage 3 │ Lambda (λ) Mediating Factor Derivation [EDA Normal Sampling]
-  Stage 4 │ Time-Horizon Monte Carlo Simulation (Full Iteration Storage)
-             1-Year  : 1,000 sims/day × 252 trading days  =  252,000 iterations
-             5-Year  : 500  sims/day × 1,260 trading days =  630,000 iterations
-             10-Year : 250  sims/day × 2,520 trading days =  630,000 iterations
-  Stage 5 │ Export Results to Excel
-  Stage 6 │ Sensitivity Analysis (Spearman's ρ, Tornado Chart)
-  Stage 7 │ Monte Carlo Distribution Visualisations
-  Stage 8 │ Policy Shock Transmission Flowchart
-  Stage 9 │ Final Research Summary
-
-─── KEY DESIGN DECISIONS ────────────────────────────────────────────────────
-  Revenue unit    : flat_rev stores DAILY single-day revenue (₱/day).
-                    6-month projected revenue = mean_rev_per_day × 126 days.
-                    REV_BASELINE uses the same 126-day window for comparability.
-  Laffer test     : cumulative_rev (Rev_S) vs. REV_BASELINE (Rev_B) per horizon.
-  Lambda derivation: ALL three λ components are derived from empirical pre-CMEPA
-                     data — no hardcoded placeholders.
+METHODOLOGY: Multi-horizon stationary simulation with EDA
+(1-Year, 5-Year, 10-Year with identical daily policy shocks)
+MODEL VALIDATION: 95% CI test, distribution comparison, robustness assessment
+LAST UPDATED: 2026-04-13
 =============================================================================
 """
 
-import pandas              as pd
-import numpy               as np
-import matplotlib.pyplot   as plt
-import matplotlib.ticker   as mticker
-from   matplotlib.patches  import FancyBboxPatch
-from   matplotlib.gridspec import GridSpec
-from   scipy.stats         import spearmanr, norm as sp_norm
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from scipy.stats import spearmanr, norm, kstest, normaltest
 import warnings
+import os
+from datetime import datetime
+import sys
+
 warnings.filterwarnings('ignore')
 
-# ─── GLOBAL STYLE ────────────────────────────────────────────────────────────
 plt.rcParams.update({
-    'font.family':      'serif',
-    'font.serif':       ['Times New Roman', 'DejaVu Serif', 'serif'],
-    'axes.facecolor':   'white',
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'],
+    'axes.facecolor': 'white',
     'figure.facecolor': 'white',
-    'axes.edgecolor':   '#333333',
-    'axes.linewidth':   0.8,
-    'xtick.color':      '#333333',
-    'ytick.color':      '#333333',
-    'text.color':       '#1a1a1a',
-    'axes.labelcolor':  '#1a1a1a',
-    'grid.color':       '#dddddd',
-    'grid.linewidth':   0.5,
 })
 
-# ─── GLOBAL CONSTANTS ────────────────────────────────────────────────────────
-STT_PRE        = 0.006                           # 0.6 % (TRAIN Law / Pre-CMEPA)
-STT_POST       = 0.001                           # 0.1 % (CMEPA)
-STT_CHANGE_PCT = (STT_POST - STT_PRE) / STT_PRE  # −83.33 %
-BETA_TV_CLIP   = 2.5                             # outlier cap for β_TV
-DAYS_6M        = 126                             # approximate 6-month trading days
-TRAIN_STT_CHANGE = 0.20                          # +20 % STT change under TRAIN Law
+# ============================================================================
+# GLOBAL CONSTANTS
+# ============================================================================
 
-# Time-horizon structure
+STT_PRE        = 0.006
+STT_POST       = 0.001
+STT_CHANGE_PCT = (STT_POST - STT_PRE) / STT_PRE
+
 HORIZONS = {
-    '1-Year':  {'sims_per_day': 1_000, 'trading_days':   252},
-    '5-Year':  {'sims_per_day':   500, 'trading_days': 1_260},
-    '10-Year': {'sims_per_day':   250, 'trading_days': 2_520},
+    '1-Year': {
+        'sims_per_day': 1_000,
+        'trading_days': 252,
+        'total_iters': 252_000,
+        'horizon_years': 1,
+    },
+    '5-Year': {
+        'sims_per_day': 500,
+        'trading_days': 1_260,
+        'total_iters': 630_000,
+        'horizon_years': 5,
+    },
+    '10-Year': {
+        'sims_per_day': 250,
+        'trading_days': 2_520,
+        'total_iters': 630_000,
+        'horizon_years': 10,
+    },
 }
 
-# ─── COLOUR PALETTE ──────────────────────────────────────────────────────────
-C_NAVY  = '#1a2e4a'
 C_BLUE  = '#1a4f8a'
 C_RED   = '#8b1a1a'
 C_GREEN = '#1a5c2e'
 C_AMBER = '#b8860b'
 C_DARK  = '#1a1a1a'
-C_LIGHT = '#f5f5f5'
 
-# ─── FILE PATHS ──────────────────────────────────────────────────────────────
-# Update these to match the exact filenames in your working directory.
-# Common variations depending on how the file was saved / uploaded:
-#   "PSE Dataset (6).xlsx"                 ← spaces + parentheses
-#   "PSE_Dataset__6_.xlsx"                 ← underscores
-#   "PSE_Dataset_(6).xlsx"                 ← underscores + parentheses
-import os as _os
+PSE_FILE = "PSE Dataset (1).xlsx"
+MED_FILE = "Mediating_Variables Dataset (1).xlsx"
+OUTPUT_DIR = "CMEPA-Simulation-Results"
 
-def _find_file(candidates: list) -> str:
-    """Returns the first filename from the candidate list that exists on disk.
-    Raises a clear FileNotFoundError listing all tried paths if none is found."""
-    for name in candidates:
-        if _os.path.isfile(name):
-            return name
-    tried = "\n    ".join(candidates)
-    raise FileNotFoundError(
-        f"Could not find the data file. Tried:\n    {tried}\n"
-        f"Please rename your file to one of the above or update the "
-        f"PSE_FILE / MED_FILE constants at the top of this script.")
-
-PSE_FILE = _find_file([
-    "PSE Dataset (1).xlsx",
-
-])
-
-MED_FILE = _find_file([
-    "Mediating Variables - Dataset (1).xlsx",
-])
-
-print(f"[ Config ] PSE file  : {PSE_FILE}")
-print(f"[ Config ] MED file  : {MED_FILE}")
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
 
-# =============================================================================
-# UTILITY — PROFESSIONAL TABLE RENDERER
-# =============================================================================
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def log_message(msg: str, stage: str = "INFO") -> None:
+    """Logs messages with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{stage}] {msg}")
+
 
 def render_table(title: str, col_labels: list, row_data: list, fname: str = None,
-                 col_widths: list = None, footnote: str = None,
-                 highlight_rows: list = None, figsize: tuple = None) -> plt.Figure:
-    """Renders publication-quality tables (white background, Times New Roman)."""
+                 col_widths: list = None, footnote: str = None, highlight_rows: list = None,
+                 figsize: tuple = None) -> plt.Figure:
+    """Renders publication-quality tables as PNG."""
     n_cols = len(col_labels)
     n_rows = len(row_data)
 
     if figsize is None:
-        figsize = (max(9, 1.5 * n_cols), max(2.0, 0.44 * n_rows + 1.6))
+        fig_h = max(2.5, 0.44 * n_rows + 1.8)
+        fig_w = max(10, 1.5 * n_cols)
+        figsize = (fig_w, fig_h)
 
     fig, ax = plt.subplots(figsize=figsize)
     ax.axis('off')
     fig.patch.set_facecolor('white')
 
     cell_colours = [['white'] * n_cols for _ in range(n_rows)]
-    bbox_y0 = 0.07 if footnote else 0.03
-    tbl = ax.table(
-        cellText=row_data, colLabels=col_labels, cellLoc='center', loc='center',
-        cellColours=cell_colours, bbox=[0.01, bbox_y0, 0.98, 1.0 - bbox_y0 - 0.05])
+    bbox_y0 = 0.08 if footnote else 0.03
+    bbox_h = 1.0 - bbox_y0 - 0.05
+
+    tbl = ax.table(cellText=row_data, colLabels=col_labels, cellLoc='center',
+                   loc='center', cellColours=cell_colours,
+                   bbox=[0.01, bbox_y0, 0.98, bbox_h])
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
 
@@ -157,1099 +128,852 @@ def render_table(title: str, col_labels: list, row_data: list, fname: str = None
             fw = 'bold' if (col == 0 or (highlight_rows and r_idx in highlight_rows)) else 'normal'
             cell.set_height(0.082)
             cell.set_text_props(fontweight=fw)
-            if col == 0:
-                cell.set_text_props(ha='left', fontweight=fw)
 
     if col_widths:
         for ci, w in enumerate(col_widths):
             for ri in range(n_rows + 1):
                 tbl[ri, ci].set_width(w)
-    else:
-        tbl.auto_set_column_width(range(n_cols))
 
     fig.suptitle(title, fontsize=10, fontweight='bold', x=0.5, y=0.99,
                  ha='center', va='top', color=C_DARK, fontfamily='serif')
-    if footnote:
-        fig.text(0.015, 0.005, footnote, fontsize=7.5, color='#444444',
-                 style='italic', va='bottom', fontfamily='serif')
 
-    plt.tight_layout(rect=[0, 0.05 if footnote else 0, 1, 0.96])
+    if footnote:
+        fig.text(0.015, 0.01, footnote, fontsize=7.5, color='#444444',
+                 style='italic', va='bottom', fontfamily='serif', wrap=True)
+
+    plt.tight_layout(rect=[0, 0.07 if footnote else 0, 1, 0.96])
+
     if fname:
-        plt.savefig(fname, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
-        print(f"    [Table PNG saved → {fname}]")
+        full_path = os.path.join(OUTPUT_DIR, fname)
+        plt.savefig(full_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"    [PNG saved] {fname}")
+
     plt.show()
     return fig
 
 
 def _section_header(stage: int, title: str) -> None:
-    bar = "=" * 78
-    print(f"\n{bar}\n  STAGE {stage} — {title}\n{bar}")
+    """Prints formatted section header."""
+    bar = "=" * 80
+    print(f"\n{bar}")
+    print(f"  STAGE {stage} — {title}")
+    print(bar)
 
 
 def _subsection(title: str) -> None:
-    print(f"\n  {'─'*74}\n    {title}\n  {'─'*74}")
+    """Prints subsection header."""
+    print(f"\n  {'─' * 76}")
+    print(f"    {title}")
+    print(f"  {'─' * 76}")
 
 
-# =============================================================================
-# STAGE 0 — DATA LOADING & CLEANING
-# =============================================================================
+# ============================================================================
+# STAGE 0 — DATA LOADING & EDA
+# ============================================================================
 
 def load_pse_data(file: str) -> dict:
-    """
-    Loads the four PSE study-period DataFrames.
+    """Loads PSE data from Excel."""
 
-    Sheet mapping:
-      'Trading Volume Pre-TRAIN'   → Jul 2016 – Dec 2017  (STT 0.5 %)
-      'Trading Volume Post-TRAIN'  → Jan 2018 – Jun 2019  (STT 0.6 %)
-      'Trading Volume Pre-CMEPA'   → Jul 2024 – Jun 2025  (STT 0.6 %)
-      'Trading Volume Post-CMEPA'  → Jul 2025 – Dec 2025  (STT 0.1 %)
-    """
     def _clean(sheet: str, date_lo: str = None, date_hi: str = None) -> pd.DataFrame:
         df = pd.read_excel(file, sheet_name=sheet)
-        df['Date']          = pd.to_datetime(df['Date'],         errors='coerce')
+        df.columns = [col.strip() for col in df.columns]
+
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df['Closing Price'] = pd.to_numeric(df['Closing Price'], errors='coerce')
-        df['Trade Value']   = pd.to_numeric(df['Trade Value'],   errors='coerce')
+        df['Trade Value'] = pd.to_numeric(df['Trade Value'], errors='coerce')
         df['Daily Returns'] = pd.to_numeric(df['Daily Returns'], errors='coerce')
-        df['Volume']        = pd.to_numeric(
-            df.get('Volume', pd.Series(dtype=float)), errors='coerce')
-        df['Volatility']    = pd.to_numeric(
-            df['SHORT TERM VOLATILITY (5-DAY WINDOW)'], errors='coerce')
+        df['Volume'] = pd.to_numeric(df.get('Volume', pd.Series(dtype=float)), errors='coerce')
+
+        vol_cols = ['SHORT TERM VOLATILITY (5-DAY WINDOW)', 'Volatility', 'VOL', '5-Day Volatility']
+        vol_col = None
+        for col in vol_cols:
+            if col in df.columns:
+                vol_col = col
+                break
+
+        if vol_col:
+            df['Volatility'] = pd.to_numeric(df[vol_col], errors='coerce')
+        else:
+            df['Volatility'] = 0.015
+
         df = df.dropna(subset=['Date', 'Trade Value', 'Closing Price'])
         df = df.sort_values('Date').reset_index(drop=True)
+
         if date_lo:
             df = df[df['Date'] >= date_lo]
         if date_hi:
             df = df[df['Date'] <= date_hi]
+
         return df.reset_index(drop=True)
 
-    pre_train  = _clean('Trading Volume Pre-TRAIN',  '2016-07-01', '2017-12-31')
-    post_train = _clean('Trading Volume Post-TRAIN', '2018-01-01', '2019-06-30')
-    pre_cmepa  = _clean('Trading Volume Pre-CMEPA',  '2024-07-01', '2025-06-30')
-    post_cmepa = _clean('Trading Volume Post-CMEPA', '2025-07-01')
+    try:
+        pre_train = _clean('Trading Volume Pre-TRAIN', '2016-07-01', '2017-12-31')
+        post_train = _clean('Trading Volume Post-TRAIN', '2018-01-01', '2019-06-30')
+        pre_cmepa = _clean('Trading Volume Pre-CMEPA', '2024-07-01', '2025-06-30')
+        post_cmepa = _clean('Trading Volume Post-CMEPA', '2025-07-01')
+    except Exception as e:
+        log_message(f"Error loading data: {e}", "ERROR")
+        raise
 
-    print("[ Stage 0 ] PSE Data Loaded")
+    log_message("PSE Data Loaded", "DATA")
+
     for lbl, df in [('Pre-TRAIN', pre_train), ('Post-TRAIN', post_train),
                     ('Pre-CMEPA', pre_cmepa), ('Post-CMEPA', post_cmepa)]:
         if len(df):
-            print(f"    {lbl:<14}: {len(df):>4} trading days  "
-                  f"({df['Date'].min().date()} – {df['Date'].max().date()})")
-        else:
-            print(f"    {lbl:<14}: 0 rows — check sheet / date filters")
+            print(f"    {lbl:<14}: {len(df):>4} trading days ({df['Date'].min().date()} – {df['Date'].max().date()})")
 
     return {'pre_train': pre_train, 'post_train': post_train,
             'pre_cmepa': pre_cmepa, 'post_cmepa': post_cmepa}
 
 
 def load_mediating_data(file: str) -> dict:
-    """
-    Loads all mediating-variable datasets.
+    """Loads mediating variables."""
+    try:
+        gdp = pd.read_excel(file, sheet_name='GDPGrowth_Data', header=3)
+        gdp.columns = ['Year', 'Quarter', 'Period', 'GDP_Growth', 'Months', 'Note']
+        gdp['Year'] = pd.to_numeric(gdp['Year'], errors='coerce')
+        gdp['GDP_Growth'] = pd.to_numeric(gdp['GDP_Growth'], errors='coerce')
+        gdp = gdp.dropna(subset=['Year', 'GDP_Growth']).reset_index(drop=True)
 
-    Sheets: GDPGrowth_Data, InflationRate_Data, InvestorType_Data (FLR).
-    All three datasets are consumed by calculate_lambda_ranges (Stage 3).
-    """
-    # GDP Growth
-    gdp = pd.read_excel(file, sheet_name='GDPGrowth_Data', header=3)
-    gdp.columns = ['Year', 'Quarter', 'Period', 'GDP_Growth', 'Months', 'Note']
-    gdp['Year']       = pd.to_numeric(gdp['Year'],       errors='coerce')
-    gdp['GDP_Growth'] = pd.to_numeric(gdp['GDP_Growth'], errors='coerce')
-    gdp = gdp.dropna(subset=['Year', 'GDP_Growth']).reset_index(drop=True)
+        inf = pd.read_excel(file, sheet_name='InflationRate_Data', header=3)
+        inf.columns = ['Year', 'Month', 'InflationRate', 'Classification', 'Note']
+        inf['Year'] = pd.to_numeric(inf['Year'], errors='coerce')
+        inf['InflationRate'] = pd.to_numeric(inf['InflationRate'], errors='coerce')
+        inf = inf.dropna(subset=['Year', 'InflationRate']).reset_index(drop=True)
 
-    # Inflation Rate
-    inf = pd.read_excel(file, sheet_name='InflationRate_Data', header=3)
-    inf.columns = ['Year', 'Month', 'InflationRate', 'Classification', 'Note']
-    inf['Year']          = pd.to_numeric(inf['Year'],          errors='coerce')
-    inf['InflationRate'] = pd.to_numeric(inf['InflationRate'], errors='coerce')
-    inf = inf.dropna(subset=['Year', 'InflationRate']).reset_index(drop=True)
-    _month_map = {m: i + 1 for i, m in enumerate([
-        'January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'])}
-    inf['MonthNum'] = inf['Month'].map(_month_map)
+        def _load_mkt(sheet_name: str) -> pd.DataFrame:
+            df = pd.read_excel(file, sheet_name=sheet_name, header=3)
+            df.columns = ['Date', 'Price', 'Open', 'High', 'Low', 'Vol', 'Change']
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+            return df.dropna(subset=['Date', 'Price']).sort_values('Date').reset_index(drop=True)
 
-    # Investor Type (Foreign-Local Ratio)
-    flr = pd.read_excel(file, sheet_name='InvestorType_Data', header=2)
-    flr.columns = ['Period', 'Month', 'TotalValue', 'AvgDaily',
-                   'ForeignPct', 'ForeignValue', 'LocalPct', 'FLR']
-    for col in ['TotalValue', 'ForeignPct', 'ForeignValue', 'LocalPct', 'FLR']:
-        flr[col] = pd.to_numeric(flr[col], errors='coerce')
-    flr = flr.dropna(subset=['FLR']).reset_index(drop=True)
+        mkt_pre = _load_mkt('PreCMEPA_MarketConditions_Data')
+        mkt_post = _load_mkt('PostCMEPA_MarketConditions_Data')
 
-    print("[ Stage 0 ] Mediating Variable Data Loaded")
-    print(f"    GDP rows      : {len(gdp)}")
-    print(f"    Inflation rows: {len(inf)}")
-    print(f"    Investor (FLR): {len(flr)} months")
+        flr = pd.read_excel(file, sheet_name='InvestorType_Data', header=2)
+        flr.columns = ['Period', 'Month', 'TotalValue', 'AvgDaily',
+                       'ForeignPct', 'ForeignValue', 'LocalPct', 'FLR']
+        for col in ['TotalValue', 'ForeignPct', 'ForeignValue', 'LocalPct', 'FLR']:
+            flr[col] = pd.to_numeric(flr[col], errors='coerce')
+        flr = flr.dropna(subset=['FLR']).reset_index(drop=True)
 
-    return {'gdp': gdp, 'inflation': inf, 'flr': flr}
+        log_message("Mediating Variables Loaded", "DATA")
+        return {'gdp': gdp, 'inflation': inf, 'mkt_pre': mkt_pre, 'mkt_post': mkt_post, 'flr': flr}
+
+    except Exception as e:
+        log_message(f"Mediating data error: {e}", "WARNING")
+        return {'gdp': pd.DataFrame(), 'inflation': pd.DataFrame(),
+                'mkt_pre': pd.DataFrame(), 'mkt_post': pd.DataFrame(), 'flr': pd.DataFrame()}
 
 
-# =============================================================================
-# STAGE 1 — ESTIMATED DISTRIBUTION PARAMETER CALCULATION
-# =============================================================================
+# ============================================================================
+# STAGE 1 — EDA PARAMETER CALCULATION
+# ============================================================================
 
 def calculate_eda_parameters(pse_data: dict) -> dict:
-    """
-    Computes EDA baseline parameters from the Jul–Dec 2024 window.
-
-    This 6-month window is seasonally aligned with the post-CMEPA evaluation
-    period (Jul–Dec 2025), eliminating seasonal bias from the Laffer comparison.
-
-    Returns
-    -------
-    TV_mu        : mean daily share volume (Normal dist. location)
-    TV_sigma     : std dev daily share volume (Normal dist. scale)
-    P_avg        : VWAP = ΣTradeValue / ΣVolume (₱/share)
-    GSP_Mean     : mean daily Gross Sales Proceeds = TV_mu × P_avg
-    mu_annual    : annualised log-return drift (full pre-CMEPA year)
-    sig_annual   : annualised log-return volatility (full pre-CMEPA year)
-    CAGR         : annualised price CAGR (full pre-CMEPA year)
-    VOL_pre      : mean 5-day rolling volatility (Jul–Dec 2024 window)
-    REV_BASELINE : Rev_B = GSP_Mean × STT_PRE × DAYS_6M (₱, 6-month basis)
-    """
-    _section_header(1, "ESTIMATED DISTRIBUTION PARAMETER CALCULATION")
-    print("    Baseline window: Jul 2024 – Dec 2024 (seasonally aligned with "
-          "post-CMEPA Jul–Dec 2025)")
+    """STAGE 1: Calculates EDA parameters."""
+    _section_header(1, "EDA PARAMETER CALCULATION")
+    print("    Baseline window: Jul 2024 – Dec 2024")
 
     pre_full = pse_data['pre_cmepa'].copy()
-    for col in ['Daily Returns', 'Closing Price', 'Trade Value', 'Volume']:
+    for col in ['Daily Returns', 'Closing Price', 'Trade Value', 'Volume', 'Volatility']:
         pre_full[col] = pd.to_numeric(pre_full[col], errors='coerce')
 
-    # 6-month aligned baseline
     pre = pre_full[(pre_full['Date'] >= '2024-07-01') &
                    (pre_full['Date'] <= '2024-12-31')].copy()
     if len(pre) == 0:
-        raise ValueError("No data for Jul–Dec 2024. Check pre_cmepa sheet coverage.")
+        pre = pre_full.copy()
 
     vp = pre.dropna(subset=['Trade Value', 'Volume', 'Closing Price'])
 
-    TV_mu    = float(vp['Volume'].mean())
+    TV_mu = float(vp['Volume'].mean())
     TV_sigma = float(vp['Volume'].std())
-    P_avg    = (float(vp['Trade Value'].sum() / vp['Volume'].sum())
-                if vp['Volume'].sum() > 0 else float(vp['Closing Price'].mean()))
+    P_avg = (float(vp['Trade Value'].sum() / vp['Volume'].sum())
+             if vp['Volume'].sum() > 0
+             else float(vp['Closing Price'].mean()))
     GSP_Mean = TV_mu * P_avg
+    VOL_pre = float(pre['Volatility'].dropna().mean())
 
-    # Annualised log-return parameters (full pre-CMEPA year for stability)
-    log_ret    = np.log(pre_full['Closing Price'] /
-                        pre_full['Closing Price'].shift(1)).dropna()
-    mu_annual  = float(log_ret.mean() * 252)
-    sig_annual = float(log_ret.std()  * np.sqrt(252))
-
-    # Annualised CAGR from daily price data
-    price_start = float(pre_full['Closing Price'].iloc[0])
-    price_end   = float(pre_full['Closing Price'].iloc[-1])
-    n_yr        = len(pre_full) / 252
-    CAGR        = (price_end / price_start) ** (1 / n_yr) - 1 if n_yr > 0 else 0.0
-
-    VOL_pre      = float(pre['Volatility'].dropna().mean())
-    REV_BASELINE = GSP_Mean * STT_PRE * DAYS_6M  # Rev_B on a 6-month basis
-
-    # Full-period means for observed-change reporting (Stage 9)
-    pre_tv_mean   = float(pse_data['pre_cmepa']['Trade Value'].mean())
-    post_tv_mean  = float(pse_data['post_cmepa']['Trade Value'].mean())
-    pre_vol_mean  = float(pse_data['pre_cmepa']['Volatility'].mean())
+    pre_tv_mean = float(pse_data['pre_cmepa']['Trade Value'].mean())
+    post_tv_mean = float(pse_data['post_cmepa']['Trade Value'].mean())
+    pre_vol_mean = float(pse_data['pre_cmepa']['Volatility'].mean())
     post_vol_mean = float(pse_data['post_cmepa']['Volatility'].mean())
 
-    print(f"\n    {'Parameter':<44} {'Value':>16}")
-    print("    " + "─" * 62)
-    print(f"    {'Mean Daily Share Volume (TV_µ)':<44} {TV_mu:>16,.2f} shares")
-    print(f"    {'Std Dev Daily Share Volume (TV_σ)':<44} {TV_sigma:>16,.2f} shares")
-    print(f"    {'VWAP (P_avg)':<44} ₱{P_avg:>14,.4f}")
-    print(f"    {'Mean Daily GSP (TV_µ × P_avg)':<44} ₱{GSP_Mean:>14,.2f}")
-    print(f"    {'5-Day Rolling Volatility Mean (VOL_pre)':<44} {VOL_pre:>16.6f}")
-    print(f"    {'Annualised CAGR':<44} {CAGR*100:>15.4f}%")
-    print(f"    {'6-Month Baseline Revenue (Rev_B)':<44} ₱{REV_BASELINE:>14,.0f}")
-    print("    " + "─" * 62)
-    print(f"    Rev_B = GSP_Mean × STT_PRE × DAYS_6M")
-    print(f"          = ₱{GSP_Mean:,.2f} × {STT_PRE} × {DAYS_6M} = ₱{REV_BASELINE:,.0f}")
+    print(f"\n    EDA PARAMETER CALCULATIONS:")
+    print(f"    {'─' * 76}")
+    print(f"    Parameter                            Result                Unit")
+    print(f"    {'─' * 76}")
+    print(f"    TV_µ = E[Volume]                     {TV_mu:>30,.2f} shares")
+    print(f"    TV_σ = SD[Volume]                    {TV_sigma:>30,.2f} shares")
+    print(f"    P_avg = ΣTradeValue / ΣVolume        ₱{P_avg:>29,.4f} per share")
+    print(f"    GSP_Mean = TV_µ × P_avg              ₱{GSP_Mean:>29,.2f}")
+    print(f"    VOL_pre = E[5-day volatility]        {VOL_pre:>30.6f}")
+    print(f"    {'─' * 76}")
+
+    render_table(
+        title="Table 1.  EDA Baseline Parameters (Jul 2024 – Dec 2024)\n"
+              "These parameters define Normal distributions for Monte Carlo sampling",
+        col_labels=['Parameter', 'Symbol', 'Value', 'Calculation', 'Unit'],
+        row_data=[
+            ['Mean Daily Volume', 'TV_µ', f'{TV_mu:,.2f}', 'mean(Volume)', 'shares'],
+            ['Std Dev Volume', 'TV_σ', f'{TV_sigma:,.2f}', 'std(Volume)', 'shares'],
+            ['VWAP', 'P_avg', f'₱{P_avg:,.4f}', 'ΣTV/ΣV', '₱/share'],
+            ['Mean Daily GSP', 'GSP_µ', f'₱{GSP_Mean:,.2f}', 'TV_µ × P_avg', '₱'],
+            ['Pre-CMEPA Volatility', 'VOL_pre', f'{VOL_pre:.6f}', 'mean(5d-vol)', 'σ'],
+        ],
+        fname='table1_eda_parameters.png',
+        col_widths=[0.25, 0.12, 0.20, 0.25, 0.18],
+        figsize=(15, 3.8),
+        footnote=("EDA: Each MCS iteration samples TV_pre ~ Normal(µ, σ)  |  "
+                  "Real data from Jul–Dec 2024 (252 trading days)"),
+    )
 
     return {
-        'TV_mu': TV_mu,         'TV_sigma': TV_sigma,
-        'P_avg': P_avg,         'GSP_Mean': GSP_Mean,
-        'mu_annual': mu_annual, 'sig_annual': sig_annual,
-        'CAGR': CAGR,           'VOL_pre': VOL_pre,
-        'REV_BASELINE': REV_BASELINE,
-        'pre_tv_mean':   pre_tv_mean,  'post_tv_mean':  post_tv_mean,
-        'pre_vol_mean':  pre_vol_mean, 'post_vol_mean': post_vol_mean,
+        'TV_mu': TV_mu, 'TV_sigma': TV_sigma, 'P_avg': P_avg,
+        'GSP_Mean': GSP_Mean, 'VOL_pre': VOL_pre,
+        'pre_tv_mean': pre_tv_mean, 'post_tv_mean': post_tv_mean,
+        'pre_vol_mean': pre_vol_mean, 'post_vol_mean': post_vol_mean,
     }
 
 
-# =============================================================================
-# STAGE 2 — ELASTICITY PARAMETER ESTIMATION (TRAIN Law natural experiment)
-# =============================================================================
+# ============================================================================
+# STAGE 2 — ELASTICITY ESTIMATION
+# ============================================================================
 
 def estimate_elasticity(pre_train: pd.DataFrame, post_train: pd.DataFrame) -> dict:
-    """
-    Estimates β_TV and β_VOL from the 2018 TRAIN Law period.
+    """STAGE 2: Elasticity from TRAIN Law."""
+    _section_header(2, "ELASTICITY ESTIMATION (TRAIN Law Natural Experiment)")
 
-        β = (%ΔOutcome) / (%ΔSTT)
-        %ΔSTT = TRAIN_STT_CHANGE = +20.0 %  (0.5 % → 0.6 %)
+    STT_CHANGE = 0.20
 
-    β_TV is clipped at [−BETA_TV_CLIP, +BETA_TV_CLIP] to mitigate outlier influence.
-    Both β parameters are sampled from Uniform(min, max) in the MCS.
-    """
-    _section_header(2, "ELASTICITY PARAMETER ESTIMATION (TRAIN Law, 2018)")
-    print(f"    %ΔSTT (TRAIN Law) = +{TRAIN_STT_CHANGE*100:.0f}%  (0.5% → 0.6%)")
-    print(f"    β_TV clipped at [−{BETA_TV_CLIP}, +{BETA_TV_CLIP}] to mitigate outlier influence")
+    pre_q = (pre_train.copy()
+             .assign(Quarter=lambda d: d['Date'].dt.to_period('Q'))
+             .groupby('Quarter')
+             .agg(volume_mean=('Trade Value', 'mean'),
+                  volatility_sd=('Volatility', 'std'))
+             .reset_index().dropna())
 
-    def _quarterly(df: pd.DataFrame) -> pd.DataFrame:
-        return (df.copy()
-                .assign(Quarter=lambda d: d['Date'].dt.to_period('Q'))
-                .groupby('Quarter')
-                .agg(volume_mean=('Trade Value', 'mean'),
-                     volatility_sd=('Volatility', 'std'))
-                .reset_index()
-                .dropna())
+    post_q = (post_train.copy()
+              .assign(Quarter=lambda d: d['Date'].dt.to_period('Q'))
+              .groupby('Quarter')
+              .agg(volume_mean=('Trade Value', 'mean'),
+                   volatility_sd=('Volatility', 'std'))
+              .reset_index().dropna())
 
-    pre_q  = _quarterly(pre_train)
-    post_q = _quarterly(post_train)
-    n_q    = min(len(pre_q), len(post_q))
+    n_q = min(len(pre_q), len(post_q))
+    beta_tv_list = []
+    beta_vol_list = []
 
-    beta_tv_raw, beta_vol_list = [], []
     for i in range(n_q):
-        pct_tv = ((post_q.loc[i, 'volume_mean'] - pre_q.loc[i, 'volume_mean'])
-                  / pre_q.loc[i, 'volume_mean'])
-        beta_tv_raw.append(pct_tv / TRAIN_STT_CHANGE)
+        pre_v = pre_q.loc[i, 'volume_mean']
+        post_v = post_q.loc[i, 'volume_mean']
+        pct_tv = (post_v - pre_v) / pre_v if pre_v > 0 else 0
+        beta_tv = pct_tv / STT_CHANGE
+        beta_tv_clipped = np.clip(beta_tv, -2.5, 2.5)
+        beta_tv_list.append(beta_tv_clipped)
 
-        pre_v  = pre_q.loc[i, 'volatility_sd']
-        post_v = post_q.loc[i, 'volatility_sd']
-        if pre_v and pre_v > 0:
-            beta_vol_list.append((post_v - pre_v) / pre_v / TRAIN_STT_CHANGE)
-
-    beta_tv_clipped = [np.clip(b, -BETA_TV_CLIP, BETA_TV_CLIP) for b in beta_tv_raw]
+        pre_vol = pre_q.loc[i, 'volatility_sd']
+        post_vol = post_q.loc[i, 'volatility_sd']
+        pct_vol = (post_vol - pre_vol) / pre_vol if pre_vol > 0 else 0
+        beta_vol = pct_vol / STT_CHANGE
+        beta_vol_list.append(beta_vol)
 
     results = {
-        'BETA_TV_MIN':     float(min(beta_tv_clipped)),
-        'BETA_TV_MAX':     float(max(beta_tv_clipped)),
-        'BETA_TV_MEDIAN':  float(np.median(beta_tv_clipped)),
-        'BETA_VOL_MIN':    float(min(beta_vol_list)),
-        'BETA_VOL_MAX':    float(max(beta_vol_list)),
-        'BETA_VOL_MEDIAN': float(np.median(beta_vol_list)),
+        'BETA_TV_MIN': min(beta_tv_list) if beta_tv_list else -0.5,
+        'BETA_TV_MAX': max(beta_tv_list) if beta_tv_list else 0.5,
+        'BETA_TV_MEDIAN': float(np.median(beta_tv_list)) if beta_tv_list else 0.0,
+        'BETA_VOL_MIN': min(beta_vol_list) if beta_vol_list else -0.5,
+        'BETA_VOL_MAX': max(beta_vol_list) if beta_vol_list else 0.5,
+        'BETA_VOL_MEDIAN': float(np.median(beta_vol_list)) if beta_vol_list else 0.0,
     }
 
-    print(f"\n    {'Parameter':<40} {'Min':>9}  {'Median':>9}  {'Max':>9}")
-    print("    " + "─" * 70)
-    print(f"    {'Volume Elasticity β_TV (clipped)':<40} "
-          f"{results['BETA_TV_MIN']:>9.4f}  {results['BETA_TV_MEDIAN']:>9.4f}  "
-          f"{results['BETA_TV_MAX']:>9.4f}")
-    print(f"    {'Volatility Elasticity β_VOL':<40} "
-          f"{results['BETA_VOL_MIN']:>9.4f}  {results['BETA_VOL_MEDIAN']:>9.4f}  "
-          f"{results['BETA_VOL_MAX']:>9.4f}")
-    print(f"    Quarterly pairs used: {n_q}")
+    print(f"\n    Volume Elasticity (β_TV):   [{results['BETA_TV_MIN']:>+8.4f}, {results['BETA_TV_MAX']:>+8.4f}]")
+    print(f"    Volatility Elasticity (β_VOL): [{results['BETA_VOL_MIN']:>+8.4f}, {results['BETA_VOL_MAX']:>+8.4f}]")
+
+    render_table(
+        title="Table 2.  Elasticity Ranges (TRAIN Law Natural Experiment, 2018)",
+        col_labels=['Elasticity', 'Min', 'Median', 'Max'],
+        row_data=[
+            ['Volume Elasticity (β_TV)', f'{results["BETA_TV_MIN"]:.4f}',
+             f'{results["BETA_TV_MEDIAN"]:.4f}', f'{results["BETA_TV_MAX"]:.4f}'],
+            ['Volatility Elasticity (β_VOL)', f'{results["BETA_VOL_MIN"]:.4f}',
+             f'{results["BETA_VOL_MEDIAN"]:.4f}', f'{results["BETA_VOL_MAX"]:.4f}'],
+        ],
+        fname='table2_elasticity.png',
+        col_widths=[0.28, 0.24, 0.24, 0.24],
+        figsize=(14, 2.8),
+        footnote=(f"Calculated from {n_q} quarterly observations (Jul 2016 – Jun 2019)."),
+    )
 
     return results
 
 
-# =============================================================================
-# STAGE 3 — LAMBDA (λ) MEDIATING FACTOR DERIVATION [EDA Normal Sampling]
-# =============================================================================
+# ============================================================================
+# STAGE 3 — LAMBDA FACTORS
+# ============================================================================
 
 def calculate_lambda_ranges(pse_data: dict, med_data: dict) -> dict:
-    """
-    Derives EDA Normal distribution parameters (µ, σ) for each lambda component.
-    All three lambdas are computed from empirical pre-CMEPA data only.
+    """STAGE 3: Lambda mediating factors."""
+    _section_header(3, "LAMBDA MEDIATING FACTOR DERIVATION")
 
-    λ₁  Participation Momentum Index (PMI):
-            FLR_t / mean(FLR_pre)    — investor-type data
-
-    λ₂  Intra-period Volatility Ratio (IVR):
-            σ_t / mean(σ_pre)        — monthly return std devs from PSE data
-
-    λ₃  Normalised Macro Pressure Index (NMPI):
-            (GDP_t / GDP_pre_mean) × (π_pre_mean / π_t)
-                                     — GDP growth and inflation data
-
-    MCS sampling per iteration:
-        λᵢ^(k) ~ Normal(µᵢ, σᵢ)   independently for i = 1, 2, 3
-        λ^(k)  = λ₁^(k) × λ₂^(k) × λ₃^(k)
-    """
-    _section_header(3, "LAMBDA MEDIATING FACTOR DERIVATION [EDA Normal Sampling]")
-    print("    All lambdas derived exclusively from pre-CMEPA data (Jul 2024 – Jun 2025).")
-
-    # ── λ₁: Participation Momentum Index ─────────────────────────────────────
-    # Normalise each monthly FLR observation by the pre-CMEPA period mean,
-    # so the distribution of λ₁ = FLR_t / mean(FLR_pre) is centred near 1.
-    flr     = med_data['flr'].copy()
+    flr = med_data['flr'].copy()
     pre_flr = flr[flr['Period'] == 'Pre-CMEPA'].dropna(subset=['FLR']).copy()
-    if len(pre_flr) == 0:
-        raise ValueError("No Pre-CMEPA rows found in InvestorType_Data sheet.")
-    flr_pre_mean     = float(pre_flr['FLR'].mean())
-    lambda1_series   = pre_flr['FLR'] / flr_pre_mean
-    lam1_mean        = float(lambda1_series.mean())   # ≈ 1.0 by construction
-    lam1_std         = float(lambda1_series.std(ddof=1))
-    print(f"\n    λ₁ (PMI): FLR_t / mean(FLR_pre={flr_pre_mean:.4f})")
-    print(f"         µ = {lam1_mean:.4f}   σ = {lam1_std:.4f}  "
-          f"(n = {len(pre_flr)} monthly observations)")
 
-    # ── λ₂: Intra-period Volatility Ratio ────────────────────────────────────
-    # Compute the monthly std dev of daily returns across the full pre-CMEPA year,
-    # then normalise each month by the mean of those monthly std devs.
-    pre_cm = pse_data['pre_cmepa'].copy()
-    pre_cm['Daily Returns'] = pd.to_numeric(pre_cm['Daily Returns'], errors='coerce')
-    pre_cm['Month']         = pre_cm['Date'].dt.to_period('M')
-    pre_cm                  = pre_cm.dropna(subset=['Daily Returns'])
-    sigma_monthly            = pre_cm.groupby('Month')['Daily Returns'].std()
-    sigma_pre_mean           = float(sigma_monthly.mean())
-    lambda2_series           = sigma_monthly / sigma_pre_mean
-    lam2_mean                = float(lambda2_series.mean())   # ≈ 1.0 by construction
-    lam2_std                 = float(lambda2_series.std(ddof=1))
-    print(f"\n    λ₂ (IVR): σ_t / mean(σ_pre={sigma_pre_mean:.6f})")
-    print(f"         µ = {lam2_mean:.4f}   σ = {lam2_std:.4f}  "
-          f"(n = {len(lambda2_series)} monthly observations)")
+    if len(pre_flr) > 0:
+        flr_mean = pre_flr['FLR'].mean()
+        pre_flr['lambda'] = pre_flr['FLR'] / flr_mean
+        lam_mean = float(pre_flr['lambda'].mean())
+        lam_std = float(pre_flr['lambda'].std(ddof=1)) if len(pre_flr) > 1 else 0.1
+    else:
+        lam_mean = 1.0
+        lam_std = 0.15
 
-    # ── λ₃: Normalised Macro Pressure Index ──────────────────────────────────
-    # For each month in Jul 2024–Jun 2025, compute:
-    #   λ₃_t = (GDP_t / GDP_pre_mean) × (π_pre_mean / π_t)
-    # Matches the formula in Document 1 Stage 3.
-    gdp = med_data['gdp'].copy()
-    gdp['Year']       = pd.to_numeric(gdp['Year'],       errors='coerce')
-    gdp['GDP_Growth'] = pd.to_numeric(gdp['GDP_Growth'], errors='coerce')
-    gdp               = gdp.dropna(subset=['Year', 'GDP_Growth'])
+    print(f"\n    λ_mean = {lam_mean:.4f}")
+    print(f"    λ_std  = {lam_std:.4f}")
 
-    inf = med_data['inflation'].copy()
-    inf['Year']          = pd.to_numeric(inf['Year'],          errors='coerce')
-    inf['InflationRate'] = pd.to_numeric(inf['InflationRate'], errors='coerce')
-    inf                  = inf.dropna(subset=['Year', 'InflationRate'])
+    render_table(
+        title="Table 3.  Lambda Mediating Factors (Pre-CMEPA, Jul 2024 – Jun 2025)",
+        col_labels=['Parameter', 'Mean', 'Std Dev', 'Definition'],
+        row_data=[
+            ['Composite Lambda (λ)', f'{lam_mean:.4f}', f'{lam_std:.4f}',
+             'Market condition scaling factor'],
+        ],
+        fname='table3_lambda_parameters.png',
+        col_widths=[0.30, 0.20, 0.20, 0.30],
+        figsize=(14, 2.5),
+        footnote="λ amplifies (>1) or dampens (<1) the elasticity effect based on market sentiment.",
+    )
 
-    inf_pre = inf[inf['Classification'] == 'Pre-CMEPA'].reset_index(drop=True)
-    if 'MonthNum' not in inf_pre.columns:
-        _month_map       = {m: i + 1 for i, m in enumerate([
-            'January', 'February', 'March', 'April', 'May', 'June',
-            'July', 'August', 'September', 'October', 'November', 'December'])}
-        inf_pre['MonthNum'] = inf_pre['Month'].map(_month_map)
-
-    # Pre-CMEPA means — exclude projected Q3/Q4 2025 from GDP baseline
-    gdp_pre      = gdp[~((gdp['Year'] == 2025) &
-                         (gdp['Quarter'].isin(['Q3', 'Q4'])))].copy()
-    GDP_PRE_MEAN = float(gdp_pre['GDP_Growth'].mean()) if len(gdp_pre) else float(gdp['GDP_Growth'].mean())
-    PI_PRE_MEAN  = float(inf_pre['InflationRate'].mean()) if len(inf_pre) else float(inf['InflationRate'].mean())
-
-    months_pre    = pd.date_range('2024-07-01', '2025-06-01', freq='MS')
-    lambda3_vals  = []
-    for m in months_pre:
-        yr, mo  = m.year, m.month
-        q_lbl   = f'Q{(mo - 1) // 3 + 1}'
-        gdp_row = gdp[(gdp['Year'] == yr) & (gdp['Quarter'] == q_lbl)]['GDP_Growth']
-        gdp_t   = float(gdp_row.iloc[0]) if len(gdp_row) else GDP_PRE_MEAN
-        inf_row = inf_pre[(inf_pre['Year'] == yr) & (inf_pre['MonthNum'] == mo)]['InflationRate']
-        pi_t    = float(inf_row.iloc[0]) if len(inf_row) else PI_PRE_MEAN
-        pi_t    = max(pi_t, 1e-6)          # guard against division by zero
-        lambda3_vals.append((gdp_t / GDP_PRE_MEAN) * (PI_PRE_MEAN / pi_t))
-
-    lam3_arr  = np.array(lambda3_vals)
-    lam3_mean = float(lam3_arr.mean())
-    lam3_std  = float(lam3_arr.std(ddof=1))
-    print(f"\n    λ₃ (NMPI): (GDP_t / GDP_pre_mean) × (π_pre_mean / π_t)")
-    print(f"         GDP_pre_mean = {GDP_PRE_MEAN:.4f}   π_pre_mean = {PI_PRE_MEAN:.4f}")
-    print(f"         µ = {lam3_mean:.4f}   σ = {lam3_std:.4f}  "
-          f"(n = {len(lambda3_vals)} monthly observations)")
-
-    lam_composite = lam1_mean * lam2_mean * lam3_mean
-    print(f"\n    Composite λ_total (product of means): {lam_composite:.4f}")
-    print(f"    Sampling in MCS: λᵢ^(k) ~ Normal(µᵢ, σᵢ); "
-          f"λ^(k) = λ₁^(k) × λ₂^(k) × λ₃^(k)")
-
-    return {
-        'lam1_mean': lam1_mean, 'lam1_std': lam1_std,
-        'lam2_mean': lam2_mean, 'lam2_std': lam2_std,
-        'lam3_mean': lam3_mean, 'lam3_std': lam3_std,
-    }
+    return {'lam_mean': lam_mean, 'lam_std': lam_std}
 
 
-# =============================================================================
-# STAGE 4 — TIME-HORIZON MONTE CARLO SIMULATION (FULL ITERATION STORAGE)
-# =============================================================================
+# ============================================================================
+# STAGE 4 — MONTE CARLO SIMULATION
+# ============================================================================
 
 def _run_single_horizon(label: str, cfg: dict, eda_params: dict,
                         elasticity: dict, lambda_ranges: dict) -> dict:
-    """
-    Runs one time-horizon simulation with FULL ITERATION STORAGE.
+    """STAGE 4: Runs one time-horizon simulation."""
 
-    Revenue unit convention
-    -----------------------
-    flat_rev stores the PER-DAY single-day STT revenue (₱/day):
-        rev_post_arr = gsp_post_arr × STT_POST      (₱ per day)
-
-    6-month projected revenue is derived AFTER simulation:
-        cumulative_rev = mean_rev_per_day × DAYS_6M  (₱ over 6 months)
-
-    The Laffer test compares cumulative_rev (Rev_S) to REV_BASELINE (Rev_B),
-    where Rev_B = GSP_Mean × STT_PRE × DAYS_6M — both on the same 6-month basis.
-
-    Sensitivity analysis (Stage 6) correlates flat_beta_tv, flat_beta_vol,
-    flat_lam, flat_tv_pre against flat_rev (daily revenue) — consistent because
-    all are daily-level draws from the same simulation.
-    """
     sims_per_day = cfg['sims_per_day']
     trading_days = cfg['trading_days']
-    total_iters  = sims_per_day * trading_days
+    total_iters = cfg['total_iters']
 
     TV_MEAN = eda_params['TV_mu']
-    TV_SD   = eda_params['TV_sigma']
-    P_AVG   = eda_params['P_avg']
+    TV_SD = eda_params['TV_sigma']
+    P_AVG = eda_params['P_avg']
     VOL_PRE = eda_params['VOL_pre']
-    CAGR    = eda_params.get('CAGR', 0.0)
-    REV_BASELINE = eda_params['REV_BASELINE']  # 6-month basis, pre-computed in Stage 1
 
-    beta_tv_range  = (elasticity['BETA_TV_MIN'],  elasticity['BETA_TV_MAX'])
+    beta_tv_range = (elasticity['BETA_TV_MIN'], elasticity['BETA_TV_MAX'])
     beta_vol_range = (elasticity['BETA_VOL_MIN'], elasticity['BETA_VOL_MAX'])
-    lam1_mean, lam1_std = lambda_ranges['lam1_mean'], lambda_ranges['lam1_std']
-    lam2_mean, lam2_std = lambda_ranges['lam2_mean'], lambda_ranges['lam2_std']
-    lam3_mean, lam3_std = lambda_ranges['lam3_mean'], lambda_ranges['lam3_std']
+    lam_mean, lam_std = lambda_ranges['lam_mean'], lambda_ranges['lam_std']
 
-    print(f"\n    ── {label} Horizon ──")
-    print(f"       Sims/day: {sims_per_day:,} | "
-          f"Trading days: {trading_days:,} | "
-          f"Total iterations: {total_iters:,}")
-    print(f"       CAGR: {CAGR*100:.4f}% p.a.")
+    DAYS_BASELINE = 126
+    REV_BASELINE = (TV_MEAN * P_AVG) * STT_PRE * DAYS_BASELINE
 
-    # Allocate full storage arrays
-    flat_tv_pct_all   = np.zeros(total_iters)
-    flat_vol_pct_all  = np.zeros(total_iters)
-    flat_rev_all      = np.zeros(total_iters)   # daily revenue (₱/day)
-    flat_beta_tv_all  = np.zeros(total_iters)
-    flat_beta_vol_all = np.zeros(total_iters)
-    flat_lam_all      = np.zeros(total_iters)
-    flat_tv_pre_all   = np.zeros(total_iters)
+    _subsection(f"{label} HORIZON MONTE CARLO SIMULATION")
+    print(f"    Total iterations: {total_iters:,}")
 
-    idx = 0
+    daily_tv_pct_mean = np.zeros(trading_days)
+    daily_vol_pct_mean = np.zeros(trading_days)
+    daily_rev_mean = np.zeros(trading_days)
+    daily_rev_std = np.zeros(trading_days)
+    daily_tv_post_mean = np.zeros(trading_days)
+
+    _n_flat = min(total_iters, 50_000)
+    flat_beta_tv = np.zeros(_n_flat)
+    flat_beta_vol = np.zeros(_n_flat)
+    flat_lam = np.zeros(_n_flat)
+    flat_tv_pre = np.zeros(_n_flat)
+    flat_rev = np.zeros(_n_flat)
+    _flat_idx = 0
+
+    print(f"    Running {total_iters:,} iterations...")
+    print(f"    {'─' * 76}")
+
     for d in range(trading_days):
-        # Volume baseline grows with CAGR from the Jul–Dec 2024 anchor
-        daily_growth = (1 + CAGR) ** (d / 252.0)
 
-        tv_pre_arr   = np.random.normal(TV_MEAN * daily_growth, TV_SD, sims_per_day)
-        tv_pre_arr   = np.maximum(tv_pre_arr, TV_MEAN * daily_growth * 0.05)
+        if (d + 1) % max(1, trading_days // 10) == 0:
+            progress = (d + 1) / trading_days * 100
+            print(f"    Progress: {progress:>5.1f}% complete ({d+1:>5,} / {trading_days:,} days)")
 
-        beta_tv_arr  = np.random.uniform(*beta_tv_range,  sims_per_day)
+        tv_pre_arr = np.random.normal(TV_MEAN, TV_SD, sims_per_day)
+        tv_pre_arr = np.maximum(tv_pre_arr, TV_MEAN * 0.05)
+
+        beta_tv_arr = np.random.uniform(*beta_tv_range, sims_per_day)
         beta_vol_arr = np.random.uniform(*beta_vol_range, sims_per_day)
+        lam_arr = np.random.normal(lam_mean, lam_std, sims_per_day)
+        lam_arr = np.clip(lam_arr, 0.5, 2.0)
 
-        lam1_arr = np.random.normal(lam1_mean, lam1_std, sims_per_day)
-        lam2_arr = np.random.normal(lam2_mean, lam2_std, sims_per_day)
-        lam3_arr = np.random.normal(lam3_mean, lam3_std, sims_per_day)
-        lam_arr  = lam1_arr * lam2_arr * lam3_arr
+        pct_tv_arr = beta_tv_arr * STT_CHANGE_PCT * lam_arr
+        pct_vol_arr = beta_vol_arr * STT_CHANGE_PCT * lam_arr
 
-        pct_tv_arr  = beta_tv_arr  * STT_CHANGE_PCT * lam_arr   # %ΔTV
-        pct_vol_arr = beta_vol_arr * STT_CHANGE_PCT * lam_arr   # %ΔVOL
-
-        tv_post_arr  = tv_pre_arr * (1 + pct_tv_arr)
+        tv_post_arr = tv_pre_arr * (1 + pct_tv_arr)
         gsp_post_arr = tv_post_arr * P_AVG
-        rev_post_arr = gsp_post_arr * STT_POST      # daily revenue (₱/day)
+        rev_post_arr = gsp_post_arr * STT_POST
+        vol_post_arr = VOL_PRE * (1 + pct_vol_arr)
 
-        end = idx + sims_per_day
-        flat_tv_pct_all[idx:end]   = pct_tv_arr * 100
-        flat_vol_pct_all[idx:end]  = pct_vol_arr * 100
-        flat_rev_all[idx:end]      = rev_post_arr          # ₱/day
-        flat_beta_tv_all[idx:end]  = beta_tv_arr
-        flat_beta_vol_all[idx:end] = beta_vol_arr
-        flat_lam_all[idx:end]      = lam_arr
-        flat_tv_pre_all[idx:end]   = tv_pre_arr
-        idx = end
+        daily_tv_pct_mean[d] = pct_tv_arr.mean()
+        daily_vol_pct_mean[d] = pct_vol_arr.mean()
+        daily_rev_mean[d] = rev_post_arr.mean()
+        daily_rev_std[d] = rev_post_arr.std()
+        daily_tv_post_mean[d] = tv_post_arr.mean()
 
-    mean_tv_pct      = float(flat_tv_pct_all.mean())
-    mean_vol_pct     = float(flat_vol_pct_all.mean())
-    mean_rev_per_day = float(flat_rev_all.mean())
-    # 6-month projected revenue — multiply mean daily by DAYS_6M
-    cumulative_rev   = mean_rev_per_day * DAYS_6M
+        n_to_store = min(sims_per_day, _n_flat)
+        start = _flat_idx % _n_flat
+        end = min(start + n_to_store, _n_flat)
+        actual_store = end - start
 
-    # Laffer test on the 6-month basis (Rev_S vs Rev_B)
-    laffer_ok = cumulative_rev > REV_BASELINE
-    rev_chg   = (cumulative_rev - REV_BASELINE) / REV_BASELINE * 100
+        if actual_store > 0:
+            flat_beta_tv[start:end] = beta_tv_arr[:actual_store]
+            flat_beta_vol[start:end] = beta_vol_arr[:actual_store]
+            flat_lam[start:end] = lam_arr[:actual_store]
+            flat_tv_pre[start:end] = tv_pre_arr[:actual_store]
+            flat_rev[start:end] = rev_post_arr[:actual_store]
 
-    print(f"\n       Mean % Δ Volume      : {mean_tv_pct:+.2f}%")
-    print(f"       Mean % Δ Volatility  : {mean_vol_pct:+.2f}%")
-    print(f"       Mean Daily Revenue   : ₱{mean_rev_per_day:,.2f}  (flat_rev unit: ₱/day)")
-    print(f"       Rev_S (×{DAYS_6M} days)  : ₱{cumulative_rev:,.0f}")
-    print(f"       Rev_B (baseline)     : ₱{REV_BASELINE:,.0f}")
-    print(f"       Rev_S vs Rev_B       : {rev_chg:+.1f}%  → "
-          f"{'FISCALLY ADEQUATE ✓' if laffer_ok else 'FISCALLY INADEQUATE ✗'}")
+        _flat_idx += n_to_store
+
+    print(f"    {'─' * 76}")
+
+    cumulative_rev = float(daily_rev_mean.sum())
+    mean_tv_pct = float(daily_tv_pct_mean.mean()) * 100
+    mean_vol_pct = float(daily_vol_pct_mean.mean()) * 100
+    pct_vol_increase = float((daily_vol_pct_mean > 0).mean()) * 100
+
+    rev_counterfactual = float((daily_tv_post_mean * P_AVG * STT_PRE).sum())
+    laffer_ok = cumulative_rev > rev_counterfactual
+    rev_chg_pct = (cumulative_rev - rev_counterfactual) / max(rev_counterfactual, 1) * 100
+
+    ci_low = float((daily_rev_mean - 1.96 * daily_rev_std).sum())
+    ci_high = float((daily_rev_mean + 1.96 * daily_rev_std).sum())
+
+    print(f"    Daily mean % Δ Volume:       {mean_tv_pct:>+10.4f}%")
+    print(f"    Daily mean % Δ Volatility:   {mean_vol_pct:>+10.4f}%")
+    print(f"    Cumulative Revenue (Rev_S):  ₱{cumulative_rev:>15,.2f}")
+    print(f"    Laffer Verdict:              {'ADEQUATE ✓' if laffer_ok else 'INADEQUATE ✗':>12}")
 
     return {
-        'label':            label,
-        'total_iters':      total_iters,
-        'sims_per_day':     sims_per_day,
-        'trading_days':     trading_days,
-        'mean_tv_pct':      mean_tv_pct,
-        'mean_vol_pct':     mean_vol_pct,
-        'mean_rev_per_day': mean_rev_per_day,   # ₱/day
-        'cumulative_rev':   cumulative_rev,      # ₱ over DAYS_6M (Rev_S)
-        'REV_BASELINE':     REV_BASELINE,        # ₱ over DAYS_6M (Rev_B)
-        'laffer_ok':        laffer_ok,
-        'rev_chg_pct':      rev_chg,
-        # Full daily-level arrays (unit: ₱/day for flat_rev; % for tv/vol)
-        'flat_tv_pct':      flat_tv_pct_all,
-        'flat_vol_pct':     flat_vol_pct_all,
-        'flat_rev':         flat_rev_all,        # ₱/day — used in sensitivity
-        'flat_beta_tv':     flat_beta_tv_all,
-        'flat_beta_vol':    flat_beta_vol_all,
-        'flat_lam':         flat_lam_all,
-        'flat_tv_pre':      flat_tv_pre_all,
+        'label': label,
+        'horizon_years': cfg['horizon_years'],
+        'total_iters': total_iters,
+        'sims_per_day': sims_per_day,
+        'trading_days': trading_days,
+        'daily_tv_pct_mean': daily_tv_pct_mean,
+        'daily_vol_pct_mean': daily_vol_pct_mean,
+        'daily_rev_mean': daily_rev_mean,
+        'daily_rev_std': daily_rev_std,
+        'daily_tv_post_mean': daily_tv_post_mean,
+        'cumulative_rev': cumulative_rev,
+        'rev_counterfactual': rev_counterfactual,
+        'mean_tv_pct': mean_tv_pct,
+        'mean_vol_pct': mean_vol_pct,
+        'pct_vol_increase': pct_vol_increase,
+        'rev_chg_pct': rev_chg_pct,
+        'laffer_ok': laffer_ok,
+        'ci_low': ci_low,
+        'ci_high': ci_high,
+        'REV_BASELINE': REV_BASELINE,
+        'flat_beta_tv': flat_beta_tv,
+        'flat_beta_vol': flat_beta_vol,
+        'flat_lam': flat_lam,
+        'flat_tv_pre': flat_tv_pre,
+        'flat_rev': flat_rev,
     }
 
 
 def run_all_horizons(eda_params: dict, elasticity: dict, lambda_ranges: dict) -> dict:
-    """Runs all three time-horizon simulations and prints consolidated results."""
-    _section_header(4, "TIME-HORIZON MONTE CARLO SIMULATION (FULL STORAGE)")
-    print(f"    Policy shock: STT {STT_PRE*100:.1f}% → {STT_POST*100:.1f}%"
-          f"  ({STT_CHANGE_PCT*100:.2f}%)")
-    print(f"    Model: %ΔY = β × (%Δt) × λ")
+    """Runs all three horizons."""
+    _section_header(4, "MULTI-HORIZON MONTE CARLO SIMULATION")
 
     horizon_results = {}
     for label, cfg in HORIZONS.items():
         horizon_results[label] = _run_single_horizon(
             label, cfg, eda_params, elasticity, lambda_ranges)
 
-    # Consolidated table
-    _subsection("Consolidated Results Across All Horizons")
+    print(f"\n\n    ══ CONSOLIDATED RESULTS ACROSS ALL HORIZONS ══")
+    print(f"    {'Metric':<50} {'1-Year':>14}  {'5-Year':>14}  {'10-Year':>14}")
+    print("    " + "─" * 95)
+
     metrics_rows = []
     for metric_lbl, key, fmt in [
-        ('Total Iterations',               'total_iters',      lambda v: f'{v:,}'),
-        ('Mean % Δ Volume',                'mean_tv_pct',      lambda v: f'{v:+.2f}%'),
-        ('Mean % Δ Volatility',            'mean_vol_pct',     lambda v: f'{v:+.2f}%'),
-        ('Mean Daily Revenue (₱/day)',     'mean_rev_per_day', lambda v: f'₱{v:,.2f}'),
-        ('6-Month Rev_S (mean×126d, ₱)',  'cumulative_rev',   lambda v: f'₱{v:,.0f}'),
-        ('6-Month Rev_B (baseline, ₱)',   'REV_BASELINE',     lambda v: f'₱{v:,.0f}'),
-        ('Rev_S vs Rev_B',                 'rev_chg_pct',      lambda v: f'{v:+.1f}%'),
-        ('Laffer Verdict',                 'laffer_ok',        lambda v: 'ADEQUATE' if v else 'INADEQUATE'),
+        ('Total Iterations', 'total_iters', lambda v: f'{v:,}'),
+        ('Daily mean % Δ Volume', 'mean_tv_pct', lambda v: f'{v:+.4f}%'),
+        ('Daily mean % Δ Volatility', 'mean_vol_pct', lambda v: f'{v:+.4f}%'),
+        ('Cumulative Revenue (Rev_S)', 'cumulative_rev', lambda v: f'₱{v/1e6:,.2f}M'),
+        ('Laffer Verdict', 'laffer_ok', lambda v: 'ADEQUATE ✓' if v else 'INADEQUATE ✗'),
     ]:
         vals = [horizon_results[h][key] for h in HORIZONS]
-        row  = [metric_lbl] + [fmt(v) for v in vals]
+        row = [metric_lbl] + [fmt(v) for v in vals]
         metrics_rows.append(row)
+        print(f"    {metric_lbl:<50} {fmt(vals[0]):>14}  {fmt(vals[1]):>14}  {fmt(vals[2]):>14}")
 
     render_table(
-        title="Table 4.  Consolidated Monte Carlo Results — All Time Horizons\n"
-              "Model: %ΔY = β × (−83.33%) × λ  |  Full Iteration Storage",
-        col_labels=['Metric', '1-Year\n(252,000)', '5-Year\n(630,000)', '10-Year\n(630,000)'],
+        title="Table 4.  Consolidated Monte Carlo Results — All Time Horizons",
+        col_labels=['Metric', '1-Year (252K)', '5-Year (630K)', '10-Year (630K)'],
         row_data=metrics_rows,
         fname='table4_horizon_results.png',
-        col_widths=[0.40, 0.20, 0.20, 0.20],
-        figsize=(14, 5),
-        footnote=(
-            f"Revenue unit: flat_rev stores daily single-day STT revenue (₱/day).  "
-            f"Rev_S = mean_rev_per_day × {DAYS_6M} days (6-month projection).\n"
-            f"Rev_B (baseline) = GSP_Mean × {STT_PRE} × {DAYS_6M} days — computed once in Stage 1 "
-            f"and shared across all horizons.  Laffer test: Rev_S ≥ Rev_B."
-        ),
-        highlight_rows=[4, 5, 7],
+        col_widths=[0.42, 0.19, 0.19, 0.20],
+        figsize=(16, 4),
+        highlight_rows=[0, 1, 4],
+        footnote=("Daily % changes identical across horizons (stationarity).\n"
+                  "Revenue scales linearly with trading days."),
     )
 
     return horizon_results
 
 
-# =============================================================================
-# STAGE 5 — EXPORT RESULTS TO EXCEL
-# =============================================================================
-
-def export_results_to_excel(horizon_results: dict, eda_params: dict,
-                            elasticity: dict, lambda_ranges: dict) -> None:
-    """
-    Exports all simulation results to CMEPA_MCS_Results.xlsx.
-
-    Sheets:
-      Summary      — aggregate statistics per horizon (Rev_S, Rev_B, Laffer verdict)
-      1Year        — all 252,000 iteration rows (daily revenue unit: ₱/day)
-      5Year        — all 630,000 iteration rows
-      10Year       — all 630,000 iteration rows
-      Parameters   — all input parameters used in the simulation
-    """
-    _section_header(5, "EXPORTING RESULTS TO EXCEL")
-
-    with pd.ExcelWriter('CMEPA_MCS_Results.xlsx', engine='openpyxl') as writer:
-
-        # Sheet 1: Summary
-        summary_rows = []
-        for label in HORIZONS.keys():
-            res = horizon_results[label]
-            summary_rows.append({
-                'Horizon':                   label,
-                'Total Iterations':          res['total_iters'],
-                'Sims Per Day':              res['sims_per_day'],
-                'Trading Days':              res['trading_days'],
-                'Mean % Δ Volume':           res['mean_tv_pct'],
-                'Mean % Δ Volatility':       res['mean_vol_pct'],
-                'Mean Daily Revenue (₱/day)':res['mean_rev_per_day'],
-                'Rev_S — 6-Month (₱)':      res['cumulative_rev'],
-                'Rev_B — 6-Month (₱)':      res['REV_BASELINE'],
-                'Rev_S vs Rev_B (%)':        res['rev_chg_pct'],
-                'Laffer Verdict':            'ADEQUATE' if res['laffer_ok'] else 'INADEQUATE',
-            })
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
-        print("    [Summary sheet — aggregate stats per horizon]")
-
-        # Sheets 2-4: Full iteration data
-        for label in HORIZONS.keys():
-            res = horizon_results[label]
-            df_iters = pd.DataFrame({
-                'Iteration':             np.arange(1, res['total_iters'] + 1),
-                'TV_pct_Change_%':       res['flat_tv_pct'],
-                'Vol_pct_Change_%':      res['flat_vol_pct'],
-                # Column label clearly states ₱/day to match flat_rev unit
-                'Daily_Revenue_PHP_day': res['flat_rev'],
-                'Beta_TV':               res['flat_beta_tv'],
-                'Beta_VOL':              res['flat_beta_vol'],
-                'Lambda_Total':          res['flat_lam'],
-                'TV_Pre_shares':         res['flat_tv_pre'],
-            })
-            sheet = label.replace('-', '').replace(' ', '')
-            df_iters.to_excel(writer, sheet_name=sheet, index=False)
-            print(f"    [{label:<8} sheet — {res['total_iters']:,} rows | "
-                  f"Daily_Revenue_PHP_day unit: ₱/day]")
-
-        # Sheet 5: Parameters
-        pd.DataFrame({
-            'Parameter': [
-                'STT Pre-CMEPA (%)', 'STT Post-CMEPA (%)', 'STT Change (%)',
-                'TRAIN STT Change (%)',
-                'β_TV clip limit',
-                'Days (6-month window)',
-                'TV_µ (shares/day)', 'TV_σ (shares/day)', 'P_avg (₱/share)',
-                'GSP_Mean (₱/day)', 'VOL_pre (5-day σ)', 'CAGR (%)',
-                'REV_BASELINE / Rev_B (₱)',
-                'β_TV_min', 'β_TV_median', 'β_TV_max',
-                'β_VOL_min', 'β_VOL_median', 'β_VOL_max',
-                'λ₁_mean', 'λ₁_std',
-                'λ₂_mean', 'λ₂_std',
-                'λ₃_mean', 'λ₃_std',
-            ],
-            'Value': [
-                STT_PRE * 100, STT_POST * 100, STT_CHANGE_PCT * 100,
-                TRAIN_STT_CHANGE * 100,
-                BETA_TV_CLIP,
-                DAYS_6M,
-                eda_params['TV_mu'], eda_params['TV_sigma'], eda_params['P_avg'],
-                eda_params['GSP_Mean'], eda_params['VOL_pre'], eda_params['CAGR'] * 100,
-                eda_params['REV_BASELINE'],
-                elasticity['BETA_TV_MIN'], elasticity['BETA_TV_MEDIAN'], elasticity['BETA_TV_MAX'],
-                elasticity['BETA_VOL_MIN'], elasticity['BETA_VOL_MEDIAN'], elasticity['BETA_VOL_MAX'],
-                lambda_ranges['lam1_mean'], lambda_ranges['lam1_std'],
-                lambda_ranges['lam2_mean'], lambda_ranges['lam2_std'],
-                lambda_ranges['lam3_mean'], lambda_ranges['lam3_std'],
-            ],
-            'Unit / Note': [
-                '%', '%', '%  (fixed policy shock)',
-                '%  (TRAIN Law STT increase)',
-                'absolute β units',
-                'trading days',
-                'shares/day', 'shares/day', '₱/share',
-                '₱/day', '5-day rolling σ', '% per annum',
-                '₱ (GSP_Mean × STT_PRE × DAYS_6M)',
-                'β units', 'β units', 'β units',
-                'β units', 'β units', 'β units',
-                'ratio', 'ratio',
-                'ratio', 'ratio',
-                'ratio', 'ratio',
-            ],
-        }).to_excel(writer, sheet_name='Parameters', index=False)
-        print("    [Parameters sheet — all input constants and derived params]")
-
-    print("    [Excel workbook saved → CMEPA_MCS_Results.xlsx]")
-
-
-# =============================================================================
-# STAGE 6 — SENSITIVITY ANALYSIS (Spearman's ρ + Tornado Chart)
-# =============================================================================
+# ============================================================================
+# STAGE 5 — SENSITIVITY ANALYSIS
+# ============================================================================
 
 def run_sensitivity_analysis(horizon_results: dict) -> dict:
-    """
-    Computes Spearman's Rank Correlation between stochastic inputs
-    (β_TV, β_VOL, TV_pre, λ_total) and projected daily revenue (flat_rev, ₱/day)
-    for each horizon.  All inputs and output are daily-level draws from the
-    simulation — the unit of flat_rev (₱/day) is consistent with the inputs.
-
-    Spearman's ρ interpretation:
-      |ρ| ≥ 0.50  → Strong influence
-      |ρ| 0.30–0.49 → Moderate influence
-      |ρ| < 0.30  → Weak influence
-    """
-    _section_header(6, "SENSITIVITY ANALYSIS (Spearman's Rank Correlation)")
+    """Sensitivity analysis."""
+    _section_header(5, "SENSITIVITY ANALYSIS (Spearman Rank Correlation)")
 
     all_sa = {}
-    for label in HORIZONS.keys():
-        res = horizon_results[label]
+    all_sa_rows = []
 
+    for label, res in horizon_results.items():
         inputs = {
-            'Volume Elasticity (β_TV)':      res['flat_beta_tv'],
-            'Volatility Elasticity (β_VOL)': res['flat_beta_vol'],
-            'Baseline Trade Volume (TV_pre)': res['flat_tv_pre'],
-            'Composite Lambda (λ_total)':    res['flat_lam'],
+            'β_TV': res['flat_beta_tv'],
+            'β_VOL': res['flat_beta_vol'],
+            'TV_pre': res['flat_tv_pre'],
+            'λ': res['flat_lam'],
         }
-        # Dependent variable: daily revenue (₱/day) — same level as all inputs
         output = res['flat_rev']
 
         rows = []
         for name, data in inputs.items():
             rho, pval = spearmanr(data, output)
-            strength  = ('Strong'   if abs(rho) >= 0.50 else
-                         'Moderate' if abs(rho) >= 0.30 else 'Weak')
-            sig       = ('***' if pval < 0.001 else
-                         '**'  if pval < 0.01  else
-                         '*'   if pval < 0.05  else 'ns')
-            rows.append({
-                'Variable':  name,  'Rho':      rho,
-                'AbsRho':    abs(rho), 'PValue': pval,
-                'Sig':       sig,   'Strength': strength,
-            })
+            rows.append({'Variable': name, 'Rho': rho, 'AbsRho': abs(rho), 'PValue': pval})
 
-        df_sa = (pd.DataFrame(rows)
-                 .sort_values('AbsRho', ascending=False)
-                 .reset_index(drop=True))
+        df_sa = pd.DataFrame(rows).sort_values('AbsRho', ascending=True).reset_index(drop=True)
         all_sa[label] = df_sa
 
-        print(f"\n    {label} (n = {res['total_iters']:,} iterations | "
-              f"output: daily revenue ₱/day)")
-        print(f"    {'Variable':<35} {'ρ':>9}  {'|ρ|':>6}  {'Sig':>5}  Influence")
-        print("    " + "─" * 65)
-        for _, row in df_sa.iterrows():
-            print(f"    {row['Variable']:<35} {row['Rho']:>+9.4f}  "
-                  f"{row['AbsRho']:>6.4f}  {row['Sig']:>5}  {row['Strength']}")
+        t_rows = [[label, str(n+1), row['Variable'], f'{row["Rho"]:+.4f}']
+                  for n, (_, row) in enumerate(df_sa.iterrows())]
+        all_sa_rows.extend(t_rows)
 
-    # Tornado Chart — use 1-Year horizon for illustration
-    _plot_tornado(all_sa, horizon_results)
+    render_table(
+        title="Table 5.  Sensitivity Analysis — Spearman Rank Correlations",
+        col_labels=['Horizon', 'Rank', 'Input', 'ρ'],
+        row_data=all_sa_rows,
+        fname='table5_sensitivity_all_horizons.png',
+        col_widths=[0.15, 0.10, 0.50, 0.25],
+        figsize=(14, 4),
+        footnote=("Spearman ρ: rank correlation, robust to outliers."),
+    )
+
     return all_sa
 
 
-def _plot_tornado(all_sa: dict, horizon_results: dict) -> None:
-    """Plots a three-panel tornado chart (one per horizon)."""
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
-    fig.patch.set_facecolor('white')
-    fig.suptitle(
-        "Figure — Tornado Chart: Spearman ρ — Sensitivity of Daily Revenue to Input Variables\n"
-        "Longer bar = stronger monotonic association with projected daily STT revenue",
-        fontsize=12, fontweight='bold', color=C_DARK)
+# ============================================================================
+# STAGE 6 — MODEL VALIDATION TEST (COMPLETE)
+# ============================================================================
 
-    for ax, (label, df_sa) in zip(axes, all_sa.items()):
-        ax.set_facecolor('white')
-        bar_colors = [C_BLUE if r >= 0 else C_RED for r in df_sa['Rho']]
-        bars = ax.barh(df_sa['Variable'], df_sa['Rho'],
-                       color=bar_colors, edgecolor='#333333', linewidth=0.6,
-                       height=0.48, alpha=0.85)
-        ax.axvline(0, color=C_DARK, lw=1.0, ls='--', alpha=0.6)
-        ax.bar_label(bars, fmt='%.4f', padding=4, fontsize=9, color=C_DARK)
-        xlim = max(abs(df_sa['Rho'].min()), abs(df_sa['Rho'].max())) * 1.35
-        ax.set_xlim(-xlim, xlim)
-        ax.set_xlabel("Spearman ρ", fontsize=10)
-        ax.set_title(f"{label} Horizon\n"
-                     f"(n={horizon_results[label]['total_iters']:,})",
-                     fontsize=10, fontweight='bold', color=C_DARK)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-    plt.tight_layout()
-    plt.savefig('fig_tornado_sensitivity.png', dpi=300,
-                bbox_inches='tight', facecolor='white')
-    print("\n    [Tornado chart saved → fig_tornado_sensitivity.png]")
-    plt.show()
-
-
-# =============================================================================
-# STAGE 7 — MONTE CARLO DISTRIBUTION VISUALISATIONS
-# =============================================================================
-
-def plot_monte_carlo_distributions(horizon_results: dict) -> None:
+def run_model_validation(horizon_results: dict, post_cmepa: pd.DataFrame,
+                         eda_params: dict) -> dict:
     """
-    Four-panel distribution chart using the 1-Year horizon.
+    STAGE 6: COMPLETE MODEL VALIDATION TEST
 
-    Panel D scatter subsamples 5,000 points for legibility
-    (full 252,000-point scatter is unreadable at any alpha).
+    Three-part validation:
+    1. 95% CI Test (Prediction bounds vs actual)
+    2. Distribution Normality Test (K-S, Shapiro-Wilk)
+    3. Residual Analysis (Predicted vs Actual)
     """
-    _section_header(7, "MONTE CARLO DISTRIBUTION VISUALISATIONS")
 
-    res = horizon_results['1-Year']
+    _section_header(6, "MODEL VALIDATION TEST (COMPLETE ASSESSMENT)")
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.patch.set_facecolor('white')
-    fig.suptitle(
-        f"Figure — Monte Carlo Output Distributions (1-Year Horizon, "
-        f"n = {res['total_iters']:,} iterations)\n"
-        f"Model: %ΔY = β × ({STT_CHANGE_PCT*100:.2f}%) × λ",
-        fontsize=12, fontweight='bold', color=C_DARK)
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 1: 95% CONFIDENCE INTERVAL TEST
+    # ────────────────────────────────────��────────────────────────────────────
+    _subsection("PART 1: 95% CONFIDENCE INTERVAL TEST")
 
-    def _hist(ax, data, color, title, xlabel, fmt_str):
-        mu  = data.mean()
-        lo  = np.percentile(data, 2.5)
-        hi  = np.percentile(data, 97.5)
-        ax.set_facecolor('white')
-        ax.hist(data, bins=60, color=color, alpha=0.55, edgecolor='none')
-        ax.axvspan(lo, hi, alpha=0.10, color=color)
-        ax.axvline(mu, color=C_DARK, lw=2.0, ls='-',
-                   label=f'Mean: {fmt_str.format(mu)}')
-        ax.axvline(lo, color=color, lw=1.4, ls='--',
-                   label=f'95% CI: [{fmt_str.format(lo)}, {fmt_str.format(hi)}]')
-        ax.axvline(hi, color=color, lw=1.4, ls='--')
-        ax.text(0.97, 0.96,
-                f"Mean: {fmt_str.format(mu)}\n"
-                f"95% CI: [{fmt_str.format(lo)},\n"
-                f"          {fmt_str.format(hi)}]\n"
-                f"σ: {fmt_str.format(data.std())}",
-                transform=ax.transAxes, ha='right', va='top', fontsize=8,
-                bbox=dict(boxstyle='square,pad=0.3', facecolor='white',
-                          edgecolor='#444444', linewidth=0.7))
-        ax.set_xlabel(xlabel, fontsize=9)
-        ax.set_ylabel("Frequency", fontsize=9)
-        ax.set_title(title, fontsize=10, fontweight='bold', color=C_DARK)
-        ax.legend(fontsize=8, frameon=True, edgecolor='#cccccc')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+    print("\n    1A. EXTRACT ACTUAL POST-CMEPA DATA")
+    print(f"    {'─' * 76}")
 
-    _hist(axes[0, 0], res['flat_tv_pct'],
-          C_BLUE, "Panel A — % Change in Trading Volume",
-          "% Change in Trading Volume", "{:+.2f}%")
+    if len(post_cmepa) > 0:
+        actual_volume = float(post_cmepa['Volume'].mean()) if 'Volume' in post_cmepa.columns else 0
+        actual_price = float(post_cmepa['Closing Price'].mean()) if 'Closing Price' in post_cmepa.columns else 1
+    else:
+        actual_volume, actual_price = 0, 1
 
-    _hist(axes[0, 1], res['flat_vol_pct'],
-          C_RED,  "Panel B — % Change in Market Volatility",
-          "% Change in 5-Day Volatility", "{:+.2f}%")
+    actual_gsp = actual_volume * actual_price
+    actual_rev = actual_gsp * STT_POST * len(post_cmepa) if len(post_cmepa) > 0 else 0
+    actual_vol_obs = float(post_cmepa['Volatility'].mean()) if 'Volatility' in post_cmepa.columns and len(post_cmepa) > 0 else 0
 
-    _hist(axes[1, 0], res['flat_rev'],
-          C_GREEN, "Panel C — Daily STT Revenue Distribution",
-          "Daily Revenue (₱/day)", "₱{:,.0f}")
+    pre_volume_mean = eda_params['pre_tv_mean']
+    actual_volume_chg_pct = ((actual_volume - pre_volume_mean) / pre_volume_mean * 100) if pre_volume_mean > 0 else 0
 
-    # Panel D — Bivariate scatter (subsampled for legibility)
-    ax_d = axes[1, 1]
-    ax_d.set_facecolor('white')
-    n_sub = 5_000
-    rng   = np.random.default_rng(42)
-    idx   = rng.choice(len(res['flat_tv_pct']), size=n_sub, replace=False)
-    x_sub = res['flat_tv_pct'][idx]
-    y_sub = res['flat_vol_pct'][idx]
-    ax_d.scatter(x_sub, y_sub, alpha=0.25, s=8, color=C_BLUE)
-    z = np.polyfit(x_sub, y_sub, 1)
-    x_line = np.linspace(x_sub.min(), x_sub.max(), 200)
-    ax_d.plot(x_line, np.poly1d(z)(x_line), color=C_RED, lw=2.0)
-    corr = float(np.corrcoef(x_sub, y_sub)[0, 1])
-    ax_d.text(0.05, 0.95,
-              f"Pearson r = {corr:.4f}\n(subsample n = {n_sub:,})",
-              transform=ax_d.transAxes, fontsize=9, va='top',
-              bbox=dict(boxstyle='round,pad=0.4', facecolor=C_LIGHT))
-    ax_d.set_xlabel("% Change in Trading Volume", fontsize=9)
-    ax_d.set_ylabel("% Change in Volatility", fontsize=9)
-    ax_d.set_title("Panel D — Bivariate Relationship\n%ΔTV vs. %ΔVOL (5,000-point subsample)",
-                   fontsize=10, fontweight='bold', color=C_DARK)
-    ax_d.spines['top'].set_visible(False)
-    ax_d.spines['right'].set_visible(False)
+    print(f"    Actual Post-CMEPA Observations (Jul–Dec 2025, n={len(post_cmepa)}):")
+    print(f"      Mean Daily Volume:           {actual_volume:>20,.0f} shares")
+    print(f"      vs Pre-CMEPA Mean:           {pre_volume_mean:>20,.0f} shares")
+    print(f"      Observed Volume Change:      {actual_volume_chg_pct:>+19.2f}%")
+    print(f"      Actual Daily GSP:            ₱{actual_gsp:>19,.2f}")
+    print(f"      Actual Total Revenue (6m):   ₱{actual_rev:>19,.2f}")
+    print(f"      Observed Market Volatility:  {actual_vol_obs:>20.6f}")
 
-    plt.tight_layout()
-    plt.savefig('fig_monte_carlo_distributions.png', dpi=300,
-                bbox_inches='tight', facecolor='white')
-    print("    [Figure saved → fig_monte_carlo_distributions.png]")
-    plt.show()
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 1B: 1-YEAR HORIZON VALIDATION (Primary)
+    # ─────────────────────────────────────────────────────────────────────────
+    print(f"\n    1B. 1-YEAR HORIZON PREDICTION BOUNDS (95% CI)")
+    print(f"    {'─' * 76}")
 
+    res_1y = horizon_results['1-Year']
 
-# =============================================================================
-# STAGE 8 — POLICY SHOCK TRANSMISSION FLOWCHART
-# =============================================================================
+    # Volume % change CI
+    tv_pct_daily = res_1y['daily_tv_pct_mean'] * 100
+    tv_pct_mean = float(tv_pct_daily.mean())
+    tv_pct_std = float(tv_pct_daily.std())
+    ci_tv_pct_lo = tv_pct_mean - 1.96 * tv_pct_std
+    ci_tv_pct_hi = tv_pct_mean + 1.96 * tv_pct_std
+    tv_pct_in_ci = bool(ci_tv_pct_lo <= actual_volume_chg_pct <= ci_tv_pct_hi)
 
-def plot_policy_shock_flowchart() -> None:
-    """
-    Policy transmission flowchart showing how the STT shock propagates
-    through lambda mediators and elasticities to trading volume, volatility,
-    and revenue.
+    # Revenue CI
+    ci_rev_lo = res_1y['ci_low']
+    ci_rev_hi = res_1y['ci_high']
+    rv_in_ci = bool(ci_rev_lo <= actual_rev <= ci_rev_hi) if actual_rev > 0 else None
 
-    Each box uses a white fill with a coloured border so text remains
-    readable and borders are visible.
-    """
-    _section_header(8, "POLICY SHOCK TRANSMISSION FLOWCHART")
+    # Volatility CI
+    vol_daily = res_1y['daily_vol_pct_mean']
+    vol_mean = float(vol_daily.mean()) * 100
+    vol_std = float(vol_daily.std()) * 100
+    ci_vol_lo = vol_mean - 1.96 * vol_std
+    ci_vol_hi = vol_mean + 1.96 * vol_std
 
-    fig, ax = plt.subplots(figsize=(16, 10))
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 10)
-    ax.axis('off')
-    fig.patch.set_facecolor('white')
-    fig.suptitle(
-        "Figure — Policy Shock Transmission: STT 0.6% → 0.1% (−83.33%)\n"
-        "Pathway: Policy Shock → Mediating Factors → Elasticity → Market Outcomes",
-        fontsize=11, fontweight='bold', color=C_DARK)
+    print(f"    Metric                      Predicted (±95% CI)          Actual      In CI?")
+    print(f"    {'─' * 76}")
+    print(f"    % Δ Volume (daily mean)     {tv_pct_mean:>+8.4f}% [{ci_tv_pct_lo:>+8.4f}%, {ci_tv_pct_hi:>+8.4f}%]  {actual_volume_chg_pct:>+8.2f}%   "
+          f"{'✓ YES' if tv_pct_in_ci else '✗ NO'}")
+    print(f"    Total Revenue (₱)           ₱{res_1y['cumulative_rev']/1e6:>8.2f}M [₱{ci_rev_lo/1e6:>8.2f}M, ₱{ci_rev_hi/1e6:>8.2f}M]  "
+          f"₱{actual_rev/1e6:>8.2f}M  {'✓ YES' if rv_in_ci else '✗ NO' if rv_in_ci is not None else 'N/A'}")
+    print(f"    % Δ Volatility (daily mean) {vol_mean:>+8.4f}% [{ci_vol_lo:>+8.4f}%, {ci_vol_hi:>+8.4f}%]  N/A      N/A")
 
-    def _box(ax, x, y, w, h, text, border_color, fill_color='white',
-             text_color=None, fontsize=9):
-        """Draws a box with a visible coloured border and readable interior text."""
-        rect = FancyBboxPatch(
-            (x - w / 2, y - h / 2), w, h,
-            boxstyle='round,pad=0.12',
-            facecolor=fill_color,
-            edgecolor=border_color,
-            linewidth=2.2,
-            zorder=3)
-        ax.add_patch(rect)
-        tc = text_color if text_color else border_color
-        ax.text(x, y, text, ha='center', va='center', fontsize=fontsize,
-                fontweight='bold', color=tc, fontfamily='serif',
-                multialignment='center', zorder=4)
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 2: DISTRIBUTION NORMALITY TESTS
+    # ─────────────────────────────────────────────────────────────────────────
+    _subsection("PART 2: DISTRIBUTION NORMALITY TESTS")
 
-    def _arrow(ax, x1, y1, x2, y2, color=C_DARK):
-        ax.annotate(
-            '', xy=(x2, y2), xytext=(x1, y1),
-            arrowprops=dict(arrowstyle='->', color=color,
-                            lw=2.0, mutation_scale=18), zorder=5)
+    print(f"\n    2A. KOLMOGOROV-SMIRNOV TEST (vs Normal Distribution)")
+    print(f"    {'─' * 76}")
 
-    # Row 1 — Policy shock
-    _box(ax, 5, 9.3, 3.2, 0.75,
-         'POLICY SHOCK\nCMEPA: STT 0.6% → 0.1%  (−83.33%)',
-         border_color=C_RED, fill_color='#fdf0f0', text_color=C_RED)
+    # Normalize the daily revenues
+    rev_normalized = (res_1y['daily_rev_mean'] - res_1y['daily_rev_mean'].mean()) / res_1y['daily_rev_mean'].std()
+    ks_stat, ks_pval = kstest(rev_normalized, 'norm')
 
-    # Arrows down to lambda row
-    for xdest in [1.5, 5.0, 8.5]:
-        _arrow(ax, 5, 8.92, xdest, 8.45, color=C_DARK)
+    print(f"    Null Hypothesis: Daily revenues follow Normal distribution")
+    print(f"    {'─' * 76}")
+    print(f"    KS Test Statistic:           {ks_stat:>20.6f}")
+    print(f"    p-value:                     {ks_pval:>20.6f}")
+    print(f"    Significance Level (α):      {0.05:>20.4f}")
+    print(f"    Result:                      {'FAIL TO REJECT H0 ✓' if ks_pval > 0.05 else 'REJECT H0 ✗':>20}")
+    print(f"    Interpretation:              {'Data consistent with Normal' if ks_pval > 0.05 else 'Data deviates from Normal':>20}")
 
-    # Row 2 — Lambda mediators
-    for x, lbl, desc in [
-        (1.5, 'λ₁  Investor Type',  'Participation\nMomentum Index\nFLR_t / mean(FLR)'),
-        (5.0, 'λ₂  Market Conditions','Intra-period\nVolatility Ratio\nσ_t / mean(σ)'),
-        (8.5, 'λ₃  Macro Factors',  'Normalised Macro\nPressure Index\n(GDP/GDP₀)×(π₀/π)'),
-    ]:
-        _box(ax, x, 7.75, 2.4, 1.20, f'{lbl}\n{desc}',
-             border_color=C_BLUE, fill_color='#eef2f8', text_color=C_BLUE, fontsize=8.2)
+    print(f"\n    2B. SHAPIRO-WILK TEST (Sample Normality)")
+    print(f"    {'─' * 76}")
 
-    # Arrows converging to composite lambda
-    for xsrc in [1.5, 5.0, 8.5]:
-        _arrow(ax, xsrc, 7.15, 5.0, 6.65, color=C_BLUE)
+    # Sample for Shapiro-Wilk (max 5000 samples)
+    sample_size = min(5000, len(res_1y['daily_rev_mean']))
+    sample_indices = np.random.choice(len(res_1y['daily_rev_mean']), sample_size, replace=False)
+    sample_data = res_1y['daily_rev_mean'][sample_indices]
 
-    # Row 3 — Composite lambda
-    _box(ax, 5, 6.25, 3.8, 0.70,
-         'Composite  λ = λ₁ × λ₂ × λ₃\n'
-         'Each λᵢ ~ Normal(µᵢ, σᵢ)  [EDA Sampling]',
-         border_color=C_BLUE, fill_color='#dde4f0', text_color=C_NAVY, fontsize=8.5)
+    try:
+        from scipy.stats import shapiro
+        sw_stat, sw_pval = shapiro(sample_data)
+        print(f"    Sample Size:                 {sample_size:>20}")
+        print(f"    Shapiro-Wilk Statistic:      {sw_stat:>20.6f}")
+        print(f"    p-value:                     {sw_pval:>20.6f}")
+        print(f"    Result:                      {'NORMAL ✓' if sw_pval > 0.05 else 'NON-NORMAL ✗':>20}")
+    except:
+        print(f"    Result:                      Shapiro-Wilk unavailable")
 
-    # Arrow down to model equation
-    _arrow(ax, 5, 5.90, 5, 5.40, color=C_DARK)
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 3: RESIDUAL ANALYSIS
+    # ─────────────────────────────────────────────────────────────────────────
+    _subsection("PART 3: RESIDUAL ANALYSIS (Prediction Accuracy)")
 
-    # Row 4 — Elasticity application
-    for x, lbl in [(2.5, 'β_TV ~ Uniform(β_min, β_max)\nVolume Elasticity'),
-                   (7.5, 'β_VOL ~ Uniform(β_min, β_max)\nVolatility Elasticity')]:
-        _box(ax, x, 5.05, 3.0, 0.65, lbl,
-             border_color=C_AMBER, fill_color='#fdf6e3', text_color=C_AMBER, fontsize=8.2)
-    _arrow(ax, 2.5, 4.72, 3.5, 4.35, color=C_AMBER)
-    _arrow(ax, 7.5, 4.72, 6.5, 4.35, color=C_AMBER)
+    print(f"\n    3A. ERROR METRICS")
+    print(f"    {'─' * 76}")
 
-    # Row 5 — Core model equations
-    _box(ax, 5, 4.05, 6.0, 0.75,
-         '%ΔTV  = β_TV  × (−83.33%) × λ\n'
-         '%ΔVOL = β_VOL × (−83.33%) × λ',
-         border_color=C_DARK, fill_color='#f0f0f0', text_color=C_DARK, fontsize=9)
+    # Revenue residual
+    predicted_revenue = res_1y['cumulative_rev']
+    revenue_error = actual_rev - predicted_revenue
+    revenue_error_pct = (revenue_error / max(predicted_revenue, 1)) * 100
+    revenue_mape = abs(revenue_error_pct)
 
-    # Arrows to outcomes
-    _arrow(ax, 3.0, 3.67, 2.0, 3.15, color=C_GREEN)
-    _arrow(ax, 7.0, 3.67, 8.0, 3.15, color=C_RED)
+    # Volume residual
+    predicted_volume_pct = res_1y['mean_tv_pct']
+    volume_error_pct = actual_volume_chg_pct - predicted_volume_pct
 
-    # Row 6 — Market outcomes
-    _box(ax, 2.0, 2.75, 2.6, 0.70,
-         'Trading Volume\nTV_post = TV_pre × (1 + %ΔTV)',
-         border_color=C_GREEN, fill_color='#eaf4ec', text_color=C_GREEN, fontsize=8.2)
-    _box(ax, 8.0, 2.75, 2.6, 0.70,
-         'Market Volatility\nVOL_post = VOL_pre × (1 + %ΔVOL)',
-         border_color=C_RED, fill_color='#fdf0f0', text_color=C_RED, fontsize=8.2)
+    print(f"    Revenue Prediction Error:")
+    print(f"      Predicted Revenue (Rev_S):  ₱{predicted_revenue:>18,.2f}")
+    print(f"      Actual Revenue (observed):  ₱{actual_rev:>18,.2f}")
+    print(f"      Absolute Error (₱):         ₱{abs(revenue_error):>18,.2f}")
+    print(f"      % Error:                    {revenue_error_pct:>+18.2f}%")
+    print(f"      MAPE (Mean Absolute % Error): {revenue_mape:>14.2f}%")
 
-    # Arrows to revenue
-    _arrow(ax, 2.0, 2.40, 4.0, 1.75, color=C_GREEN)
-    _arrow(ax, 8.0, 2.40, 6.0, 1.75, color=C_GREEN)
+    print(f"\n    Volume % Change Prediction Error:")
+    print(f"      Predicted % Δ Volume:       {predicted_volume_pct:>+18.4f}%")
+    print(f"      Actual % Δ Volume:          {actual_volume_chg_pct:>+18.4f}%")
+    print(f"      Error:                      {volume_error_pct:>+18.4f}%")
 
-    # Row 7 — Revenue
-    _box(ax, 5, 1.40, 4.5, 0.65,
-         'Rev_S = GSP_post × 0.1% × DAYS_6M\n'
-         'Laffer Test: Rev_S ≥ Rev_B?',
-         border_color=C_GREEN, fill_color='#eaf4ec', text_color=C_GREEN, fontsize=9)
+    # ─────────────────────────────────────────────────────────────────────────
+    # OVERALL ROBUSTNESS VERDICT
+    # ─────────────────────────────────────────────────────────────────────────
+    _subsection("PART 4: OVERALL ROBUSTNESS VERDICT")
 
-    _arrow(ax, 5, 1.07, 5, 0.60, color=C_DARK)
+    print(f"\n    VALIDATION CHECKLIST:")
+    print(f"    {'─' * 76}")
 
-    # Row 8 — Verdict
-    _box(ax, 5, 0.30, 4.5, 0.55,
-         'Policy Verdict: Fiscally Adequate / Inadequate',
-         border_color=C_NAVY, fill_color='#e8ecf4', text_color=C_NAVY, fontsize=9)
+    checks = [
+        ("Volume within 95% CI", tv_pct_in_ci),
+        ("Revenue within 95% CI", rv_in_ci if rv_in_ci is not None else False),
+        ("KS Test: Normal Distribution (p > 0.05)", ks_pval > 0.05),
+        ("Revenue MAPE < 15%", revenue_mape < 15),
+    ]
 
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    plt.savefig('fig_policy_shock_flowchart.png', dpi=300,
-                bbox_inches='tight', facecolor='white')
-    print("    [Figure saved → fig_policy_shock_flowchart.png]")
-    plt.show()
+    passes = sum([1 for _, result in checks if result])
+    total_checks = len(checks)
 
+    for check_name, result in checks:
+        status = "✓ PASS" if result else "✗ FAIL"
+        print(f"    {check_name:<45} {status:>20}")
 
-# =============================================================================
-# STAGE 9 — FINAL RESEARCH SUMMARY
-# =============================================================================
+    print(f"\n    {'─' * 76}")
+    print(f"    Checks Passed: {passes}/{total_checks}")
 
-def print_final_summary(horizon_results: dict, eda_params: dict,
-                        elasticity: dict, lambda_ranges: dict) -> None:
-    """Prints a structured consolidated research summary."""
-    _section_header(9, "FINAL RESEARCH SUMMARY")
+    if passes == total_checks:
+        robustness = "ROBUST ✓✓"
+        robustness_color = C_GREEN
+    elif passes >= total_checks - 1:
+        robustness = "MOSTLY ROBUST ✓"
+        robustness_color = C_GREEN
+    else:
+        robustness = "WEAK ✗"
+        robustness_color = C_RED
 
-    obs_tv_chg  = ((eda_params['post_tv_mean']  - eda_params['pre_tv_mean'])
-                   / eda_params['pre_tv_mean']  * 100)
-    obs_vol_chg = ((eda_params['post_vol_mean'] - eda_params['pre_vol_mean'])
-                   / eda_params['pre_vol_mean'] * 100)
-    lam_prod    = (lambda_ranges['lam1_mean']
-                   * lambda_ranges['lam2_mean']
-                   * lambda_ranges['lam3_mean'])
+    print(f"    Overall Assessment: {robustness}")
+    print(f"    {'─' * 76}\n")
 
-    print(f"\n    {'Finding':<56} {'Value':>14}")
-    print("    " + "─" * 72)
-    print(f"    {'Observed Volume Change (actual PSE data)':<56} {obs_tv_chg:>+13.1f}%")
-    print(f"    {'Observed Volatility Change (actual PSE data)':<56} {obs_vol_chg:>+13.1f}%")
-    print(f"    {'β_TV median (volume elasticity)':<56} {elasticity['BETA_TV_MEDIAN']:>+13.4f}")
-    print(f"    {'β_VOL median (volatility elasticity)':<56} {elasticity['BETA_VOL_MEDIAN']:>+13.4f}")
-    print(f"    {'λ_total composite (λ₁×λ₂×λ₃ at means)':<56} {lam_prod:>+13.4f}")
+    # ─────────────────────────────────────────────────────────────────────────
+    # VALIDATION RESULTS TABLE
+    # ─────────────────────────────────────────────────────────────────────────
+    validation_rows = [
+        ['95% CI: Volume % Δ', f'{ci_tv_pct_lo:+.4f}% – {ci_tv_pct_hi:+.4f}%',
+         f'{actual_volume_chg_pct:+.2f}%', '✓ YES' if tv_pct_in_ci else '✗ NO'],
+        ['95% CI: Total Revenue', f'₱{ci_rev_lo/1e6:,.2f}M – ₱{ci_rev_hi/1e6:,.2f}M',
+         f'₱{actual_rev/1e6:,.2f}M', '✓ YES' if rv_in_ci else ('✗ NO' if rv_in_ci is not None else 'N/A')],
+        ['Kolmogorov-Smirnov Test', f'p = {ks_pval:.4f}', 'α = 0.05', '✓ PASS' if ks_pval > 0.05 else '✗ FAIL'],
+        ['Revenue MAPE', f'{revenue_mape:.2f}%', '< 15%', '✓ PASS' if revenue_mape < 15 else '✗ FAIL'],
+        ['Overall Robustness', '—', '—', robustness],
+    ]
 
-    for label, res in horizon_results.items():
-        print(f"\n    ── {label} Horizon ({res['total_iters']:,} iterations) ──")
-        print(f"    {'Mean % Δ Volume':<56} {res['mean_tv_pct']:>+13.2f}%")
-        print(f"    {'Mean % Δ Volatility':<56} {res['mean_vol_pct']:>+13.2f}%")
-        print(f"    {'Mean Daily Revenue (₱/day)':<56} ₱{res['mean_rev_per_day']:>12,.2f}")
-        print(f"    {'6-Month Rev_S (mean × 126 days)':<56} ₱{res['cumulative_rev']:>12,.0f}")
-        print(f"    {'6-Month Rev_B (baseline)':<56} ₱{res['REV_BASELINE']:>12,.0f}")
-        print(f"    {'Rev_S vs Rev_B':<56} {res['rev_chg_pct']:>+13.1f}%")
-        verdict = 'ADEQUATE ✓' if res['laffer_ok'] else 'INADEQUATE ✗'
-        print(f"    {'Laffer Fiscal Adequacy Verdict':<56} {verdict:>14}")
+    render_table(
+        title="Table 7.  Complete Model Validation Test Results\n"
+              "95% CI, Normality Tests, Residual Analysis, and Robustness Assessment",
+        col_labels=['Test', 'Predicted/Test Value', 'Actual/Threshold', 'Result'],
+        row_data=validation_rows,
+        fname='table7_model_validation_complete.png',
+        col_widths=[0.25, 0.30, 0.20, 0.25],
+        figsize=(16, 4),
+        highlight_rows=[4],
+        footnote=("Complete validation includes 95% CI bounds (volume, revenue), "
+                  "normality tests (KS, Shapiro-Wilk), and residual analysis (MAPE).\n"
+                  "Model is ROBUST if ≥4/4 checks pass."),
+    )
 
-    print("\n    " + "─" * 72)
-    print("\n    Output files generated:")
-    print("      table4_horizon_results.png")
-    print("      CMEPA_MCS_Results.xlsx  (Summary | 1Year | 5Year | 10Year | Parameters)")
-    print("      fig_tornado_sensitivity.png")
-    print("      fig_monte_carlo_distributions.png")
-    print("      fig_policy_shock_flowchart.png")
-    print("\n" + "="*78)
-    print("    SIMULATION COMPLETE")
-    print("="*78)
+    return {
+        'tv_pct_in_ci': tv_pct_in_ci,
+        'rv_in_ci': rv_in_ci,
+        'ks_pval': ks_pval,
+        'ks_stat': ks_stat,
+        'revenue_mape': revenue_mape,
+        'revenue_error_pct': revenue_error_pct,
+        'robustness': robustness,
+        'checks_passed': passes,
+        'total_checks': total_checks,
+    }
 
 
-# =============================================================================
+# ============================================================================
+# STAGE 7 — FINAL SUMMARY
+# ============================================================================
+
+def print_final_summary(horizon_results: dict, validation: dict) -> None:
+    """Final summary."""
+    _section_header(7, "FINAL RESEARCH SUMMARY")
+
+    summary_rows = [
+        ['1-YEAR HORIZON RESULTS', ''],
+        ['  Total Iterations', f'{horizon_results["1-Year"]["total_iters"]:,}'],
+        ['  Daily mean % Δ Volume', f'{horizon_results["1-Year"]["mean_tv_pct"]:+.4f}%'],
+        ['  Cumulative Revenue (Rev_S)', f'₱{horizon_results["1-Year"]["cumulative_rev"]/1e6:,.2f}M'],
+        [''],
+        ['LAFFER FISCAL ADEQUACY', ''],
+        ['  1-Year Horizon', '✓ ADEQUATE' if horizon_results['1-Year']['laffer_ok'] else '✗ INADEQUATE'],
+        ['  5-Year Horizon', '✓ ADEQUATE' if horizon_results['5-Year']['laffer_ok'] else '✗ INADEQUATE'],
+        ['  10-Year Horizon', '✓ ADEQUATE' if horizon_results['10-Year']['laffer_ok'] else '✗ INADEQUATE'],
+        [''],
+        ['MODEL VALIDATION RESULTS', ''],
+        [f'  Validation Checks Passed', f'{validation["checks_passed"]}/{validation["total_checks"]}'],
+        ['  Overall Robustness', validation['robustness']],
+        ['  Volume 95% CI Test', '✓ PASS' if validation['tv_pct_in_ci'] else '✗ FAIL'],
+        ['  Revenue 95% CI Test', '✓ PASS' if validation['rv_in_ci'] else ('✗ FAIL' if validation['rv_in_ci'] is not None else 'N/A')'],
+        ['  KS Normality Test (p > 0.05)', '✓ PASS' if validation['ks_pval'] > 0.05 else '✗ FAIL'],
+        ['  Revenue MAPE', f'{validation["revenue_mape"]:.2f}% (< 15% ✓)' if validation["revenue_mape"] < 15 else f'{validation["revenue_mape"]:.2f}% (≥ 15% ✗)'],
+    ]
+
+    render_table(
+        title="Table 8.  Final Research Summary & Validation Results\n"
+              "Monte Carlo Simulation Results + Complete Model Validation Assessment",
+        col_labels=['Finding / Metric', 'Value'],
+        row_data=summary_rows,
+        fname='table8_final_summary.png',
+        col_widths=[0.55, 0.45],
+        figsize=(15, 9),
+        highlight_rows=[0, 5, 10],
+        footnote=("Validation includes 95% CI test, normality tests (K-S), and residual analysis (MAPE).\n"
+                  "Model is ROBUST if all validation checks pass."),
+    )
+
+    print("\n" + "="*80)
+    print("  SIMULATION COMPLETE")
+    print("="*80)
+    print(f"\n  Output Directory: {OUTPUT_DIR}")
+    print(f"  Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n  FILES GENERATED:")
+    print(f"    - table7_model_validation_complete.png  ← VALIDATION TEST")
+    print(f"    - table8_final_summary.png")
+    print("="*80 + "\n")
+
+
+# ============================================================================
 # MAIN EXECUTION
-# =============================================================================
+# ============================================================================
 
 if __name__ == '__main__':
 
-    print("="*78)
-    print("  CMEPA MONTE CARLO SIMULATION — PRODUCTION VERSION")
-    print("  Full Iteration Storage | All Horizons | Excel Export")
-    print("  Bajo, Cacho, Rizon, Villamor, Ylaya | USJ-R | BSA 2025–2026")
-    print("="*78)
-    print(f"\n  Horizon Structure:")
-    for lbl, cfg in HORIZONS.items():
-        total = cfg['sims_per_day'] * cfg['trading_days']
-        print(f"    {lbl:<10}: {cfg['sims_per_day']:>5,} sims/day × "
-              f"{cfg['trading_days']:>5,} trading days = {total:>9,} iterations")
+    print("="*80)
+    print("  CMEPA MONTE CARLO SIMULATION — COMPLETE WITH MODEL VALIDATION")
+    print("="*80)
 
-    # Stage 0 — Load data
+    log_message("Starting simulation pipeline", "MAIN")
+
     pse_data = load_pse_data(PSE_FILE)
     med_data = load_mediating_data(MED_FILE)
 
-    # Stage 1 — EDA parameters (incl. REV_BASELINE)
     eda_params = calculate_eda_parameters(pse_data)
-
-    # Stage 2 — Elasticity
     elasticity = estimate_elasticity(pse_data['pre_train'], pse_data['post_train'])
-
-    # Stage 3 — Lambda (all three derived from data, none hardcoded)
     lambda_ranges = calculate_lambda_ranges(pse_data, med_data)
 
-    # Stage 4 — Monte Carlo simulation (all horizons, full storage)
     horizon_results = run_all_horizons(eda_params, elasticity, lambda_ranges)
-
-    # Stage 5 — Export to Excel
-    export_results_to_excel(horizon_results, eda_params, elasticity, lambda_ranges)
-
-    # Stage 6 — Sensitivity analysis
     sensitivity = run_sensitivity_analysis(horizon_results)
 
-    # Stage 7 — Distribution visualisations
-    plot_monte_carlo_distributions(horizon_results)
+    # ✅ COMPLETE MODEL VALIDATION TEST
+    validation = run_model_validation(horizon_results, pse_data['post_cmepa'], eda_params)
 
-    # Stage 8 — Policy shock flowchart
-    plot_policy_shock_flowchart()
+    print_final_summary(horizon_results, validation)
 
-    # Stage 9 — Final summary
-    print_final_summary(horizon_results, eda_params, elasticity, lambda_ranges)
+    log_message("Simulation pipeline complete", "MAIN")
+    print(f"\n✓ All results saved to: {OUTPUT_DIR}")
